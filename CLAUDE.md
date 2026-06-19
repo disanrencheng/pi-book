@@ -30,6 +30,18 @@
 | [ch30-32-philosophy.spec.md](specs/ch30-32-philosophy.spec.md) | 第 30-32 章：设计哲学 | 1.5d | ch15-18, ch19-23 |
 | [appendix.spec.md](specs/appendix.spec.md) | 附录 A-D | 0.5d | ch08-10, ch19-23 |
 
+### 更新合约（v0.66.1 → v0.79.7 同步）
+
+基线 v0.66.1（commit c779c14e）已落后于当前 v0.79.7。以下更新合约定义了同步任务，按 `depends` 顺序执行：
+
+| Spec 文件 | 覆盖 | 预估工时 | 依赖 |
+|-----------|------|---------|------|
+| [update-structural.spec.md](specs/update-structural.spec.md) | 7→4 包、scope 迁移、移出包 ch02/03/27/28/29 | 1d | - |
+| [update-ai.spec.md](specs/update-ai.spec.md) | ch04-07,18：OAuth 5→3、thinkingLevelMap、图像生成 | 1.5d | update-structural |
+| [update-runtime.spec.md](specs/update-runtime.spec.md) | ch08-10：terminate、turn 回调、AgentHarness | 1d | update-ai |
+| [update-coding-agent.spec.md](specs/update-coding-agent.spec.md) | ch11-17,19-23,26：Project Trust、XML 边界、SDK 新章 | 3d | update-runtime |
+| [update-tui.spec.md](specs/update-tui.spec.md) | ch24-25：Container.render、Kitty 图片、grapheme | 1d | update-coding-agent |
+
 ### 依赖关系（关键路径用粗线标注）
 
 ```
@@ -86,6 +98,5 @@ agent-spec verify specs/ch04-07-pi-ai.spec.md
 - `../packages/agent/` — pi-agent-core 层
 - `../packages/coding-agent/` — pi-coding-agent 层
 - `../packages/tui/` — pi-tui 层
-- `../packages/mom/` — mom (Slack bot)
-- `../packages/pods/` — pods (GPU 编排)
-- `../packages/web-ui/` — Web UI
+
+> 注：`mom`、`pods`、`web-ui` 三个包已从主仓库移出（详见第 2 章及 ch27/28/29 章首注记），不再位于 `../packages/` 下。第 27/28/29 章的源码引用应以 v0.66.1 历史快照（commit `c779c14e`）为准。

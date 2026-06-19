@@ -45,13 +45,19 @@ flowchart TB
     CheckError -->|否| CheckToolCalls{响应含\ntool calls?}
     
     CheckToolCalls -->|有| ExecuteTools[执行工具调用]
-    ExecuteTools --> PollSteering{再次检查\nsteering 消息}
+    ExecuteTools --> Terminate{工具批次\n全部 terminate?}
+    Terminate -->|是| TurnEnd
+    Terminate -->|否| TurnEnd[emit turn_end]
+    CheckToolCalls -->|无| TurnEnd
+
+    TurnEnd --> PrepareNext[prepareNextTurn\n可换 model/context/thinking]
+    PrepareNext --> StopAfter{shouldStopAfterTurn?}
+    StopAfter -->|是| Done
+    StopAfter -->|否| PollSteering{检查\nsteering 消息}
     PollSteering -->|有| InjectMessages
-    PollSteering -->|无| CheckToolCalls2{还有\ntool calls?}
+    PollSteering -->|无| CheckToolCalls2{还有\ntool calls?\n（!terminate）}
     CheckToolCalls2 -->|有| StreamLLM
-    CheckToolCalls2 -->|无| ExitInner
-    
-    CheckToolCalls -->|无| ExitInner[内层循环结束]
+    CheckToolCalls2 -->|无| ExitInner[内层循环结束]
     
     ExitInner --> CheckFollowUp{有 follow-up\n消息?}
     CheckFollowUp -->|有| SetPending[设为 pending\n重新进入内层]
@@ -83,7 +89,7 @@ flowchart TB
 让我们看看实际代码。为了聚焦设计，这里展示 `runLoop()` 的核心结构（简化版，省略了 `turn_start`/`turn_end` 事件发射和 `firstTurn` 首轮保护逻辑，完整版见源码）：
 
 ```typescript
-// packages/agent/src/agent-loop.ts:155-232（简化）
+// packages/agent/src/agent-loop.ts:166-260（简化）
 
 async function runLoop(
   currentContext: AgentContext,
@@ -129,20 +135,38 @@ async function runLoop(
       // 4. 提取 tool calls，有则执行
       const toolCalls = message.content
         .filter((c) => c.type === "toolCall");
-      hasMoreToolCalls = toolCalls.length > 0;
+      const toolResults: ToolResultMessage[] = [];
+      hasMoreToolCalls = false;
 
-      if (hasMoreToolCalls) {
-        const toolResults = await executeToolCalls(
+      if (toolCalls.length > 0) {
+        const batch = await executeToolCalls(
           currentContext, message, config, signal, emit
         );
-        for (const result of toolResults) {
+        for (const result of batch.messages) {
           currentContext.messages.push(result);
           newMessages.push(result);
         }
+        toolResults.push(...batch.messages);
+        // 工具可主动叫停：整批结果都标记 terminate 时不再续轮
+        hasMoreToolCalls = !batch.terminate;
       }
 
       // emit turn_end
-      // 5. 检查有无 steering 消息
+
+      // 5. turn 间热切换：可替换 context / model / thinkingLevel
+      const snapshot = await config.prepareNextTurn?.({
+        message, toolResults, context: currentContext, newMessages,
+      });
+      // ...（应用 snapshot 到 currentContext / config，此处省略）
+
+      // 6. turn 后优雅停止
+      if (await config.shouldStopAfterTurn?.({
+        message, toolResults, context: currentContext, newMessages,
+      })) {
+        return; // emit agent_end 后退出
+      }
+
+      // 7. 检查有无 steering 消息
       pendingMessages =
         (await config.getSteeringMessages?.()) || [];
     }
@@ -169,6 +193,15 @@ async function runLoop(
 **2. 错误通过 `stopReason` 传递，而不是异常**。当 LLM 调用失败时，`streamAssistantResponse` 不会抛异常 — 它返回一个 `stopReason` 为 `"error"` 的消息。这和第 6 章讲的"错误编码进事件流"的设计一脉相承。循环引擎不需要 try-catch，它只需要检查 `stopReason`。
 
 **3. 函数签名是纯函数式的**。`runLoop` 接收 context、config、signal，返回 void（通过 `newMessages` 数组收集产出）。它不持有任何状态，不修改任何外部变量（除了 `currentContext.messages` 和 `newMessages` 这两个被调用者传入的可变引用）。
+
+**4. 内层循环靠 `terminate` 决定续轮，而不是"还有没有 tool calls"**。早期版本里内层条件是 `hasMoreToolCalls = toolCalls.length > 0` — 只要这一轮发生过工具调用就一定再调一次 LLM。v0.69.0 起，`executeToolCalls` 不再返回一个 `ToolResultMessage[]`，而是返回 `{ messages, terminate }`（`agent-loop.ts:208-210`、`:390-393`）。续轮条件变成 `hasMoreToolCalls = !executedToolBatch.terminate`。
+
+`terminate` 是一个**工具主动叫停**的提示：工具结果（`AgentToolResult.terminate`，`types.ts:354`）或 `afterToolCall` 返回的 `terminate`（`types.ts:80`）都能设置它。但叫停只在**整批工具结果都标记 `terminate` 时**才生效 —— `shouldTerminateToolBatch()` 要求 `finalizedCalls.every(f => f.result.terminate === true)`（`agent-loop.ts:544-545`）。这给了工具一种干净的"任务已完成，无需再让模型说话"的退出通道（例如一个显式的 `finish`/`done` 工具），而不必依赖模型自己决定停止。
+
+**5. turn 之间有两个新的干预点**。每个 turn 的 `turn_end` 之后、决定是否发起下一次 LLM 调用之前，循环依次调用两个可选回调（`agent-loop.ts:226-251`）：
+
+- `prepareNextTurn(ctx)`（v0.72.0）：返回一个 `AgentLoopTurnUpdate`，可在 turn 之间**热切换** `context` / `model` / `thinkingLevel`。返回 `undefined` 则沿用当前配置。这让"先用便宜模型探路、命中难点再升档"这类策略可以在**同一次循环运行内**完成，而不必结束循环重启。
+- `shouldStopAfterTurn(ctx)`（v0.72.0）：返回 `true` 则在本 turn 后优雅退出（emit `agent_end`），且发生在 steering / follow-up 轮询之前。它与 `terminate` 的区别是控制权归属：`terminate` 由工具发出，`shouldStopAfterTurn` 由调用者（上层）发出。
 
 ## 消息变换管道：只在 LLM 边界发生
 
@@ -263,6 +296,13 @@ interface AgentLoopConfig extends SimpleStreamOptions {
   getSteeringMessages?: () => Promise<AgentMessage[]>;
   getFollowUpMessages?: () => Promise<AgentMessage[]>;
 
+  // turn 级控制（v0.72.0 新增）
+  shouldStopAfterTurn?: (ctx: ShouldStopAfterTurnContext)
+    => boolean | Promise<boolean>;
+  prepareNextTurn?: (ctx: PrepareNextTurnContext)
+    => AgentLoopTurnUpdate | undefined
+     | Promise<AgentLoopTurnUpdate | undefined>;
+
   // 工具执行控制
   beforeToolCall?: (context, signal?)
     => Promise<BeforeToolCallResult | undefined>;
@@ -281,6 +321,7 @@ interface AgentLoopConfig extends SimpleStreamOptions {
 - `convertToLlm` 是必须提供的（循环没有默认的转换逻辑，但 `Agent` 类提供了一个默认实现：只保留 `user`、`assistant`、`toolResult` 三种角色）
 - `transformContext` 是可选的（不提供就不裁剪）
 - `getSteeringMessages` 和 `getFollowUpMessages` 是可选的（不提供就没有消息队列）
+- `shouldStopAfterTurn` 和 `prepareNextTurn` 是可选的（不提供就既不提前停、也不在 turn 间换模型）
 - `beforeToolCall` 和 `afterToolCall` 是可选的（不提供就没有工具钩子；返回 `undefined` 表示不做任何修改）
 - `getApiKey` 是可选的（注释说明了用途："important for expiring tokens"，支持同步或异步返回以适配不同的认证后端）
 
@@ -361,5 +402,9 @@ agent_end
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。`runLoop()` 的双层循环结构自引入以来保持稳定，
-> steering/follow-up 消息队列的设计在早期版本中从单队列拆分为双队列。
+> 本章核心分析基于 pi-mono v0.66.0，并同步到 v0.79.7。`runLoop()` 的双层循环结构
+> 自引入以来保持稳定，steering/follow-up 消息队列在早期版本中从单队列拆分为双队列。
+> v0.69.0 起内层续轮条件由"是否还有 tool calls"改为基于工具批次的 `terminate` 提示
+> （`executeToolCalls` 现返回 `{ messages, terminate }`）；v0.72.0 在每个 turn 之间新增
+> `prepareNextTurn`（热切换 model/context/thinkingLevel）与 `shouldStopAfterTurn`
+> （turn 后优雅停止）两个可选回调。

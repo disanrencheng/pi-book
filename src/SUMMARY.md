@@ -10,7 +10,7 @@
 
 # 第一篇：分层的纪律
 
-- [七个包不是七个项目](./ch02-packages.md)
+- [四个包不是四个项目](./ch02-packages.md)
 - [怎样高效阅读这个仓库](./ch03-reading-map.md)
 
 # 第二篇：统一调用面 — pi-ai 的设计
@@ -53,6 +53,7 @@
 - [pi-tui — 在终端里做应用](./ch24-tui.md)
 - [编辑器组件 — 交互复杂度的集中地](./ch25-editor.md)
 - [RPC 模式 — pi 作为后端服务](./ch26-rpc.md)
+- [SDK — 把 pi 当库用](./ch26b-sdk.md)
 - [pi-web-ui — 浏览器里的复用](./ch27-web-ui.md)
 
 # 第八篇：产品化实证

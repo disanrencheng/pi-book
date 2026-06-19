@@ -148,7 +148,7 @@ pi 的定位更接近运行时：
 
 **没有强制的项目结构**。pi 不要求你的项目遵循特定的目录布局或配置格式。Extension 是一个 TypeScript 文件，导出一个工厂函数 — 就这些。没有 decorator、没有 annotation、没有继承链。
 
-**不隐藏底层**。pi-ai 层提供了统一的 provider 抽象，但如果你需要直接访问底层 provider 的原始 API（比如 Anthropic 的 prompt caching），可以直接导入 `@mariozechner/pi-ai/anthropic` 使用 provider 特定的功能。抽象是可穿透的。
+**不隐藏底层**。pi-ai 层提供了统一的 provider 抽象，但如果你需要直接访问底层 provider 的原始 API（比如 Anthropic 的 prompt caching），可以直接导入 `@earendil-works/pi-ai/anthropic` 使用 provider 特定的功能。抽象是可穿透的。
 
 这不是说 "运行时" 比 "框架" 更好。框架的优势是**降低入门门槛** — 开发者不需要理解完整的系统就能开始使用。pi 的运行时定位意味着开发者需要更多的理解成本，换来的是更多的控制权。
 

@@ -22,15 +22,16 @@ type KnownApi =
   | "anthropic-messages"
   | "bedrock-converse-stream"
   | "google-generative-ai"
-  | "google-gemini-cli"
   | "google-vertex";
 
 type Api = KnownApi | (string & {});
 ```
 
-注意 `Api` 类型的设计：它是 `KnownApi`（已知的 10 种 API 协议）加上 `(string & {})`（任意字符串）的联合。这个看似奇怪的 `(string & {})` 是 TypeScript 的一个技巧 — 它让类型系统对已知值提供自动补全，同时允许任意新值。内建的 10 种协议有 IDE 提示，自定义协议可以用任意字符串注册。
+注意 `Api` 类型的设计：它是 `KnownApi`（已知的 9 种 API 协议）加上 `(string & {})`（任意字符串）的联合。这个看似奇怪的 `(string & {})` 是 TypeScript 的一个技巧 — 它让类型系统对已知值提供自动补全，同时允许任意新值。内建的 9 种协议有 IDE 提示，自定义协议可以用任意字符串注册。
 
-`Provider` 类型列出了 23 个已知供应商，也允许扩展 — 但用的是普通的 `string` 联合而非 `(string & {})` 技巧（IDE 补全效果略弱）：
+> **版本提示**：v0.71.0 移除了 `google-gemini-cli`（连同 Antigravity 的支持一并删除），`KnownApi` 从 10 种降为 9 种。
+
+`Provider` 类型列出了约 35 个已知供应商（v0.66 时为 23 个，随 DeepSeek、Moonshot、Fireworks、xAI、Vercel AI Gateway 等内建化而增长），也允许扩展 — 但用的是普通的 `string` 联合而非 `(string & {})` 技巧（IDE 补全效果略弱）：
 
 ```typescript
 type Provider = KnownProvider | string;
@@ -89,10 +90,12 @@ compat?: TApi extends "openai-completions"
   ? OpenAICompletionsCompat
   : TApi extends "openai-responses"
     ? OpenAIResponsesCompat
-    : never;
+    : TApi extends "anthropic-messages"
+      ? AnthropicMessagesCompat
+      : never;
 ```
 
-当 `TApi` 是 `"openai-completions"` 时，`compat` 的类型是 `OpenAICompletionsCompat`（包含兼容性开关如 `supportsStreaming`）。当 `TApi` 是 `"anthropic-messages"` 时，`compat` 是 `never` — 根本不存在这个字段。
+当 `TApi` 是 `"openai-completions"` 时，`compat` 的类型是 `OpenAICompletionsCompat`（包含兼容性开关如 `supportsStreaming`）。条件类型有三个分支：v0.66 时只有 `openai-completions` 与 `openai-responses`，其余 api 的 `compat` 是 `never`；后来新增了第三个分支 `anthropic-messages → AnthropicMessagesCompat`（`types.ts:602-608`），用于表达 Anthropic 兼容厂商（如 Fireworks、Bedrock）之间的差异开关 — `supportsEagerToolInputStreaming`、`forceAdaptiveThinking`、`allowEmptySignature`、`supportsTemperature` 等。其余 api 协议的 `compat` 仍是 `never`。
 
 更重要的是，`Model<TApi>` 的泛型参数会传递给 `StreamFunction`：
 
@@ -378,7 +381,7 @@ export function registerBuiltInApiProviders(): void {
     stream: streamOpenAIResponses,
     streamSimple: streamSimpleOpenAIResponses,
   });
-  // ... 8 more providers ...
+  // ... 7 more providers ...
 }
 
 registerBuiltInApiProviders(); // 模块加载时立即执行
@@ -451,7 +454,7 @@ function loadAnthropicProviderModule() {
 
 ### 为什么不在启动时全部加载？
 
-pi 支持 10 种内建 API 协议。如果在启动时 eager load 所有 provider 模块，会引入大量不需要的代码（每个 provider 模块都依赖对应厂商的 SDK）。一个只用 Anthropic 的用户不需要加载 Google Vertex 的 SDK；一个只用 OpenAI 的用户不需要加载 AWS Bedrock 的 SDK。
+pi 支持 9 种内建 API 协议。如果在启动时 eager load 所有 provider 模块，会引入大量不需要的代码（每个 provider 模块都依赖对应厂商的 SDK）。一个只用 Anthropic 的用户不需要加载 Google Vertex 的 SDK；一个只用 OpenAI 的用户不需要加载 AWS Bedrock 的 SDK。
 
 延迟加载的代价是第一次调用某个 provider 时有一个微小的延迟（模块加载的时间）。但这个代价只发生一次，而且在 agent 场景下，第一次 LLM 调用的网络延迟远大于模块加载延迟。
 
@@ -506,7 +509,7 @@ const deepseekR1: Model<"openai-responses"> = {
 
 **3. 极简的公共 API**。注册表只暴露 5 个函数。用户面对的 `stream.ts` 只有 4 个函数。新的 provider 开发者只需要实现 `stream` 和 `streamSimple` 两个方法。
 
-**4. 启动零成本**。延迟加载确保了只有实际使用的 provider 模块才会被加载。10 个内建 provider 中，一次会话通常只加载 1-2 个。
+**4. 启动零成本**。延迟加载确保了只有实际使用的 provider 模块才会被加载。9 种内建 api 协议对应的 provider 模块中，一次会话通常只加载 1-2 个。
 
 **5. 复杂性集中**。整个 pi-ai 层的"设计复杂性"集中在 98 行的 `api-registry.ts` 中。`stream.ts` 是纯粹的委托；`register-builtins.ts` 是纯粹的样板。理解了注册表，就理解了一切。
 
@@ -525,7 +528,9 @@ const deepseekR1: Model<"openai-responses"> = {
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。`api-registry.ts` 自引入以来结构保持稳定。
-> `sourceId` 机制是后来为支持 extension 动态注册/注销而添加的。
-> `KnownApi` 和 `KnownProvider` 的列表会随新 provider 的加入而增长，但注册表的设计不变。
-> 延迟加载模式（`createLazyStream`）在早期版本中不存在，是随着 provider 数量增长到 10+ 后引入的性能优化。
+> 本章核心分析基于 pi-mono v0.66.0，截至 v0.79.7 注册表设计未变，但列表与 compat 有调整：
+> - `KnownApi` 从 10 种降为 9 种 — v0.71.0 移除 `google-gemini-cli`（与 Antigravity 一起删除）。
+> - `KnownProvider` 从 23 个增长到约 35 个（DeepSeek、Moonshot、Fireworks、xAI、Vercel AI Gateway、OpenCode 等内建化）。
+> - `compat` 条件类型新增第三分支 `anthropic-messages → AnthropicMessagesCompat`。
+> - v0.74.1 起新增了一套**并行的图像生成注册表** `images-api-registry.ts`，与本章的文本注册表同构但独立（详见第 18 章）。
+> `api-registry.ts` 本身、`sourceId` 机制、延迟加载模式（`createLazyStream`）保持稳定。

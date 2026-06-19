@@ -21,8 +21,11 @@ interface Model<TApi extends Api> {
   maxTokens: number;     // 32768
   input: ("text" | "image" | "audio")[];
   reasoning: boolean;    // true
+  thinkingLevelMap?: ThinkingLevelMap; // 见下文
 }
 ```
+
+其中 `thinkingLevelMap`（`types.ts:590`）是后来新增的顶层字段：它把 pi 统一的思考档位（`off`/`minimal`/`low`/`medium`/`high`/`xhigh`）映射到该 provider 专用的取值，`null` 表示某档位不支持。配套的 `getSupportedThinkingLevels(model)` 与 `clampThinkingLevel(model, level)`（`models.ts:53`、`:64`）据此计算模型实际支持的档位并把越界请求收敛到最近的合法档。它取代了早期写在 `compat.reasoningEffortMap` 里的映射（旧的 `supportsXhigh()` 也随之废弃）。
 
 这些参数来自三个来源：
 
@@ -371,11 +374,11 @@ private loadCustomModels(modelsJsonPath: string): CustomModelsResult {
     const content = readFileSync(modelsJsonPath, "utf-8");
     const config: ModelsConfig = JSON.parse(content);
 
-    // 第一层：JSON Schema 验证（字段类型、必填项）
-    const validate = ajv.getSchema("ModelsConfig")!;
-    if (!validate(config)) {
-      const errors = validate.errors?.map(
-        (e: any) => `  - ${e.instancePath}: ${e.message}`
+    // 第一层：Schema 验证（字段类型、必填项）— 用 typebox 编译的校验器
+    const result = ModelsConfigCheck.Check(config);
+    if (!result) {
+      const errors = [...ModelsConfigCheck.Errors(config)].map(
+        (e) => `  - ${e.path}: ${e.message}`
       ).join("\n");
       return emptyCustomModelsResult(
         `Invalid models.json schema:\n${errors}`
@@ -397,7 +400,7 @@ private loadCustomModels(modelsJsonPath: string): CustomModelsResult {
 
 两层验证的策略是：
 
-1. **Schema 验证**（使用 Ajv）：检查 JSON 的结构 — 字段名是否正确、类型是否匹配、必填项是否存在。这能捕获大部分拼写错误和格式错误。
+1. **Schema 验证**（使用 typebox 编译的校验器）：检查 JSON 的结构 — 字段名是否正确、类型是否匹配、必填项是否存在。这能捕获大部分拼写错误和格式错误。pi 在 v0.69.0 把校验栈从 `@sinclair/typebox` 0.34 + Ajv 迁移到 `typebox` 1.x 自带的 `Compile`/`Check`，关键收益是：在禁用 `eval` 的运行时（如 Cloudflare Workers）也能真正执行校验，而不是静默跳过。
 
 2. **语义验证**（`validateConfig`）：检查业务规则 — 比如 "定义了 custom models 就必须提供 baseUrl"。这是 Schema 无法表达的约束。
 
@@ -450,13 +453,13 @@ const OpenAICompletionsCompatSchema = Type.Object({
   supportsStore: Type.Optional(Type.Boolean()),
   supportsDeveloperRole: Type.Optional(Type.Boolean()),
   supportsReasoningEffort: Type.Optional(Type.Boolean()),
-  reasoningEffortMap: Type.Optional(ReasoningEffortMapSchema),
   maxTokensField: Type.Optional(Type.Union([
     Type.Literal("max_completion_tokens"),
     Type.Literal("max_tokens")
   ])),
   thinkingFormat: Type.Optional(Type.Union([
     Type.Literal("openai"), Type.Literal("openrouter"),
+    Type.Literal("together"), Type.Literal("deepseek"),
     Type.Literal("zai"), Type.Literal("qwen"),
     Type.Literal("qwen-chat-template"),
   ])),
@@ -464,6 +467,8 @@ const OpenAICompletionsCompatSchema = Type.Object({
   // ... 更多字段
 });
 ```
+
+> **版本变化（v0.72.0，破坏性）**：早期 `compat` 里有一个 `reasoningEffortMap` 字段承载"pi 档位 → provider effort 值"的映射。它已被移除，映射上移为 `Model` 的顶层 `thinkingLevelMap`（见本章开头），并对所有 api 协议通用，而不再局限于 OpenAI Completions 的 compat。
 
 为什么需要这个 compat 层？因为 "OpenAI 兼容" 是一个光谱，不是一个二元属性。各种 provider（OpenRouter、Vercel AI Gateway、Ollama、LM Studio、vLLM）声称兼容 OpenAI API，但具体兼容到什么程度各不相同：
 
@@ -473,6 +478,22 @@ const OpenAICompletionsCompatSchema = Type.Object({
 - 有的不在 streaming 中返回 usage 信息
 
 `compat` 字段把这些差异编码到模型定义中，让 provider 实现可以根据这些标志调整请求格式。这避免了为每个 "OpenAI 兼容" 的 provider 写一个单独的 provider 实现。
+
+## 并行的图像生成目录 —— 事件流的一个反例
+
+v0.74.1 起，pi-ai 多出一套**与文本侧完全并行、但彼此独立**的图像生成子系统：`images-api-registry.ts`（注册表，与第 4 章的 `api-registry.ts` 同构）、`image-models.ts` + `image-models.generated.ts`（图像模型目录，与本章的 `models.generated.ts` 同构），以及 `ImagesModel<TApi>`、`ImagesProvider`、`AssistantImages` 等类型（`types.ts:611`、`:335`）。内建支持 OpenRouter 图像生成（`KnownImagesApi = "openrouter-images"`）。
+
+值得注意的是它在一个设计点上**与文本生成相反**。文本侧的 `StreamFunction` 返回事件流（第 6 章论证了"为什么是事件流"），而图像侧的核心函数签名是：
+
+```typescript
+// packages/ai/src/types.ts:232-236
+export type ImagesFunction<TApi, TOptions> = (
+  model: ImagesModel<TApi>,
+  ...
+) => Promise<AssistantImages>;
+```
+
+它返回的是 `Promise<AssistantImages>`，**不是事件流**。原因正好印证第 6 章的论点：事件流的价值在于"增量产出 + 渐进式消费"——文本是一个 token 一个 token 流出来的，UI 需要边收边渲染。而图像生成没有有意义的中间增量（用户要的是最终那张图），于是退回最简单的 `Promise`。同一个团队、同一套注册表模式，却因为**输出是否有增量价值**而选择了不同的返回类型。这是"按场景选择抽象"而非"教条地统一抽象"的一个清晰例证。
 
 ## 取舍分析
 
@@ -493,5 +514,8 @@ const OpenAICompletionsCompatSchema = Type.Object({
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。内建模型目录通过自动化脚本定期更新。
-> `models.json` 的自定义能力和 extension 动态注册是产品化阶段添加的。
+> 本章核心分析基于 pi-mono v0.66.0，截至 v0.79.7 注册机制未变，但模型能力描述方式有破坏性调整：
+> - **思考档位映射**：`thinkingLevelMap`（顶层 Model 字段）取代 `compat.reasoningEffortMap`（v0.72.0），新增 `getSupportedThinkingLevels`/`clampThinkingLevel`，废弃 `supportsXhigh()`。
+> - **校验栈迁移**：`models.json` 校验从 `@sinclair/typebox` 0.34 + Ajv 迁移到 `typebox` 1.x 的 `Compile`/`Check`（v0.69.0），适配禁用 `eval` 的运行时。
+> - **图像生成子系统**：v0.74.1 新增并行的图像注册表与模型目录（见上节），返回 `Promise` 而非事件流。
+> 内建模型目录仍由自动化脚本在构建时生成；`models.json` 覆盖与 extension 动态注册保持稳定。

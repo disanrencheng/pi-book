@@ -353,7 +353,7 @@ export type AgentMessage =
 
 ```typescript
 // 在 pi-coding-agent 中
-declare module "@mariozechner/agent" {
+declare module "@earendil-works/pi-agent-core" {
   interface CustomAgentMessages {
     custom: CustomMessage;        // compaction 摘要、分支标记等
     bashExecution: BashMessage;   // bash 工具的结构化结果
@@ -396,6 +396,41 @@ type AgentMessage =
 
 这张表揭示了一个设计原则：**Agent 只管运行时状态，不管配置和策略。** 它知道自己正在用什么模型（`state.model`），但不知道为什么选这个模型。它知道有哪些工具可用（`state.tools`），但不知道这些工具是怎么被发现和注册的。它知道 system prompt 是什么（`state.systemPrompt`），但不知道 prompt 是怎么从多个来源拼接出来的。
 
+## 另一条路：`AgentHarness` 这个"厚壳"
+
+上面那张表的每一行 —— 会话持久化、压缩、skills、工具来源 —— `Agent` 都明确委托给了上层（coding-agent 包）。但 packages/agent 在 v0.79 周期里长出了**第二条路径**：`AgentHarness`（`packages/agent/src/harness/agent-harness.ts:174`），它把那张表里委托出去的东西**反过来收编回了 agent 包内部**。
+
+如果说 `Agent` 是"薄壳 + 上层自己拼装一切"，`AgentHarness` 就是一个"自带电池"的厚壳：
+
+| 表里委托出去的 | `AgentHarness` 的内聚实现 |
+|---|---|
+| 会话持久化（SessionManager） | `SessionRepo` 抽象 + `JsonlSessionRepo` / `InMemorySessionRepo`（`harness/session/`）、session tree、`fork()`、`navigateTree()` |
+| Context 压缩（Compaction） | 内置 `compact()` / `prepareCompaction` + 分支摘要（`harness/compaction/`） |
+| Skills / Prompt 模板 | `skill(name)` / `promptFromTemplate(name, args)`（`harness/skills.ts`、`prompt-templates.ts`） |
+| 工具来源（Extension） | `getTools`/`setTools` 与 `getActiveTools`/`setActiveTools` 二层模型 + 重名校验 |
+| 文件系统 / shell 触达 | `ExecutionEnv` 抽象：`FileSystem` + `Shell`，Node 实现见 `harness/env/nodejs.ts` |
+
+它还提供了比 `Agent.subscribe()` 更丰富的**类型化钩子链** `on(type, handler)`（`agent-harness.ts:1050`）—— `before_provider_request`、`after_provider_response`、`tool_call`/`tool_result`、`session_before_compact` / `session_compact`、`session_before_tree` / `session_tree` 等 —— 以及一套 `Result<T, E>` 风格的错误模型（`AgentHarnessError` 归一化 `SessionError`/`CompactionError`/`BranchSummaryError`，`agent-harness.ts:145-151`）和显式的运行阶段机 `AgentHarnessPhase = "idle" | "turn" | "compaction" | "branch_summary" | "retry"`（`types.ts:492`），用 `phase !== "idle"` 守卫拒绝重入。
+
+```mermaid
+flowchart LR
+    subgraph thin["薄壳路径（生产在用）"]
+        Agent["Agent\n只管运行时状态"]
+        Upper["coding-agent 上层\nSessionManager/Compaction/\nExtension/Skills"]
+        Agent -.委托.-> Upper
+    end
+    subgraph thick["厚壳路径（演进中）"]
+        Harness["AgentHarness\n自带会话/压缩/skills/ExecutionEnv"]
+    end
+    Loop["agentLoop\n（同一个无状态引擎）"]
+    Agent --> Loop
+    Harness --> Loop
+```
+
+**必须如实说明它的采用状态**：截至 v0.79.7，**生产的 coding-agent 仍然用 `new Agent({...})`**（`packages/coding-agent/src/core/sdk.ts:293`），`AgentHarness` 目前只在 agent 包自身的测试与 `docs/{agent-harness,durable-harness,hooks}.md` 里使用，coding-agent 源码中没有任何 `AgentHarness` 引用。所以它是一个**演进中的并行抽象**，不是已经取代 `Agent` 的新默认。
+
+这两条路线本身就是本书主线的一次张力实验：`Agent` 把厚度留给上层、换取内核纯净；`AgentHarness` 把厚度收回内核、换取开箱即用的持久会话与分支能力。两者共享同一个 `agentLoop` 引擎 —— 厚薄之争发生在引擎之上，而引擎自己始终只管转。
+
 ## 取舍分析
 
 ### 得到了什么
@@ -417,7 +452,11 @@ type AgentMessage =
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。`Agent` 类的核心结构自引入以来保持稳定。
+> 本章核心分析基于 pi-mono v0.66.0，并同步到 v0.79.7。`Agent` 类的核心结构自引入
+> 以来保持稳定，仍是生产 coding-agent 的运行时壳（`coding-agent/src/core/sdk.ts:293`）。
 > `PendingMessageQueue` 的 `"all"` | `"one-at-a-time"` 模式是后来的增强，
 > 早期版本只有 `"one-at-a-time"` 行为。`CustomAgentMessages` 声明合并机制
-> 在 pi-agent-core 从 pi-coding-agent 分离时引入，解决了包间类型依赖问题。
+> 在 pi-agent-core 从 pi-coding-agent 分离时引入，解决了包间类型依赖问题
+> （模块名随 scope 迁移为 `@earendil-works/pi-agent-core`）。v0.79 周期新增的
+> `AgentHarness` 子系统（`packages/agent/src/harness/`）把会话/压缩/skills/ExecutionEnv
+> 内聚进 agent 包，是与 `Agent` 并存的"厚壳"路径，目前仅在 agent 包自身测试/docs 中使用。

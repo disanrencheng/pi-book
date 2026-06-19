@@ -2,7 +2,7 @@
 
 > **定位**：本章总论 pi 的工具设计哲学 — 为什么给 LLM 的接口越受约束，犯错越少。
 > 前置依赖：第 9 章（工具执行管道）。
-> 适用场景：当你想理解 pi 为什么有 7 个专用工具而不是只给一个 bash。
+> 适用场景：当你想理解 pi 为什么有 6 个结构化工具 + bash 后备，而不是只给一个 bash。
 
 ## 为什么不只给一个 bash？
 
@@ -10,7 +10,7 @@
 
 理论上，bash 能做一切 — 读文件用 `cat`、写文件用 `echo >`、搜索用 `grep`、编辑用 `sed`。一个万能工具，LLM 自己组合命令。
 
-但 pi 选择了 7 个专用工具 + bash 作为后备：
+但 pi 选择了 **6 个结构化工具 + bash 后备**（共 7 个内置工具，工具名见 `allToolNames`：`read`、`write`、`edit`、`find`、`grep`、`ls`、`bash`，core/tools/index.ts:84）：
 
 ```mermaid
 graph TB
@@ -75,9 +75,9 @@ export interface ToolDefinition<
 2. **`prepareArguments` 是兼容性钩子** — 当 LLM 使用旧版参数格式时，在 schema 验证之前转换参数（edit 工具用这个把 `oldText/newText` 转为 `edits[]`，详见第 20 章）
 3. **`promptSnippet` 和 `promptGuidelines`** — 工具不仅定义参数，还参与 system prompt 的组装。工具激活时，它的 guidelines 会自动注入到 prompt 中
 
-## 七个工具的 Schema 一览
+## 七个内置工具的 Schema 一览
 
-每个工具的参数定义都是 `Type.Object` — 以下并排展示它们的参数结构，方便看出设计差异：
+每个工具的参数定义都是 `Type.Object`（6 个结构化工具加上 bash 后备，共 7 个）— 以下并排展示它们的参数结构，方便看出设计差异：
 
 ```typescript
 // packages/coding-agent/src/core/tools/read.ts:17-21
@@ -185,6 +185,28 @@ export function wrapToolDefinition<TDetails = unknown>(
 
 反向也有支持 — `createToolDefinitionFromAgentTool` 把一个 `AgentTool` 包装回 `ToolDefinition`，用于外部提供的工具覆盖需要进入 definition-first 注册表的场景。
 
+## 工具激活：名字白名单 + cwd 工厂
+
+v0.68.0 重写了"宿主如何选择启用哪些工具"的模型。早期 pi 导出一组**预构建的工具对象**（`readTool`、`bashTool`、`codingTools` 等）供调用方直接拼装。现在改为两个更小的原语：一个**字符串名字白名单**，加上**按 cwd 构造**的工厂函数。
+
+```typescript
+// packages/coding-agent/src/core/tools/index.ts:83-117（节选）
+export type ToolName = "read" | "bash" | "edit" | "write" | "grep" | "find" | "ls";
+export const allToolNames: Set<ToolName> =
+  new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+
+// 按名字 + cwd 构造单个工具
+export function createTool(toolName: ToolName, cwd: string, options?: ToolsOptions): Tool;
+// 一次性构造全部编码工具
+export function createCodingTools(cwd: string, options?: ToolsOptions): Tool[];
+```
+
+两个设计点：
+
+1. **激活是名字白名单**。SDK 调用方通过 `createAgentSession({ tools: ["read", "bash"] })`（`tools?: string[]`，sdk.ts:67）声明启用哪些工具；CLI 上则有 `--tools` / `--no-tools`（全禁）/ `--no-builtin-tools` / `--exclude-tools` 四个开关。白名单里既可以写内建工具名，也可以写 extension 注册的工具名 —— 两者在选择层面一视同仁（第 15 章）。
+
+2. **构造需要显式 cwd**。注意 `createTool(name, cwd, options)` 和 `createCodingTools(cwd)` 都把 `cwd` 作为必传参数。工具不再隐式读取 `process.cwd()`，而是绑定到调用方传入的工作目录 —— 这与第 14 章 system prompt、第 17 章 resource loader 的"去 process-global"是同一条纪律，也是 pi 能在一个进程里并存多个工作目录（RPC、SDK、子 agent）的前提。
+
 ## 截断策略：`truncate.ts`
 
 LLM 的 context window 是有限的。当 `read` 读了一个 50000 行的日志，或者 `grep` 匹配了 10000 条结果，把全部输出塞进 tool result 会浪费 token、甚至超出限制。
@@ -253,7 +275,7 @@ export const GREP_MAX_LINE_LENGTH = 500;
 
 ### Pluggable I/O
 
-7 个核心工具都提供了 `Operations` 接口：
+内置工具大多提供了 `Operations` 接口（bash 用 `exec`）：
 
 ```typescript
 // packages/coding-agent/src/core/tools/edit.ts:63-70
@@ -288,14 +310,14 @@ interface EditOperations {
 
 ### 放弃了什么
 
-**更多的工具选择负担**。LLM 需要在 7 个工具中选择正确的一个。system prompt 中的工具使用指引（"用 Read 而不是 cat，用 Edit 而不是 sed"）帮助 LLM 做出选择。
+**更多的工具选择负担**。LLM 需要在 6 个结构化工具 + bash 中选择正确的一个。注意 system prompt 不再用"优先用 grep/find/ls 而非 bash"这类指引去替模型选工具（该指引已于 v0.77.0 删除，详见第 14 章）—— 现在的判断是：工具的取舍由"哪些工具被激活"表达，而非靠 prompt 文字。
 
 **灵活性受限**。有些操作在 bash 中一行命令就能完成（如 `wc -l *.ts | sort -n`），但没有对应的专用工具。pi 的策略是：对于**高频且容易出错**的操作（读、写、编辑、搜索）提供专用工具，其他操作留给 bash。
 
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。7 个核心工具是逐步从 bash 中分离出来的 —
-> 早期版本只有 bash + read + edit，后来加入 write、find、grep、ls。
-> `ToolDefinition` 接口是在 extension 系统（第 15 章）引入后统一的，
-> 之前内置工具直接实现 `AgentTool` 接口。
+> 本章核心分析基于 pi-mono v0.66.0，已校订至 v0.79.7。6 个结构化工具（read/write/edit/find/grep/ls）+ bash 后备是逐步从 bash 中分离出来的 —
+> 早期版本只有 bash + read + edit，后来加入 write、find、grep、ls，工具名集中在 `allToolNames`。
+> 主要设计级变化：v0.68.0 重写工具激活模型 —— 从导出预构建工具对象改为"字符串名字白名单 + cwd 工厂"（`createTool(name, cwd)` / `createCodingTools(cwd)`），SDK 用 `tools: string[]` 选择、CLI 用 `--tools`/`--no-tools`/`--no-builtin-tools`/`--exclude-tools`。
+> `ToolDefinition` 接口在 extension 系统（第 15 章）引入后统一；参数 schema 改用 `typebox` 1.x（第 15 章）。

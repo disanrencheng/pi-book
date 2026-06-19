@@ -4,6 +4,8 @@
 > 前置依赖：第 11 章（会话管理）、第 22 章（bash 工具）。
 > 适用场景：当你想理解"同一个 agent 内核，不同的产品壳"在实践中是什么样。
 
+> **历史快照说明**：`mom` 包已于 commit `0ed0d434`（2026-04-30）从 pi-mono 主仓库移出；其方向性继任为独立项目 GitHub `earendil-works/pi-chat`。本章的全部分析、包名（`@mariozechner/pi-mom`）与版本号均基于 v0.66.1 历史快照（commit `c779c14e`）——当时该包仍在 `packages/mom/`。保留本章，是因为它是"同一个 agent 内核、不同的产品壳"这一设计论点最完整的实证案例（参见第 2 章关于包移出标准的讨论），但请勿据此在当前主仓库中查找对应代码。
+
 ## 从终端到 Slack：同一个内核，不同的壳
 
 pi CLI 是终端里的 coding agent。mom 是 Slack 里的 coding agent。两者共享同一个内核（pi-ai + pi-agent-core），但产品形态完全不同：

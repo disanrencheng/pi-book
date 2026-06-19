@@ -310,6 +310,10 @@ if (assistantMsg.stopReason === "error"
 
 合成的 tool result 都标记为 `isError: true`，内容为 `"No result provided"`。这个设计有双重目的：一是满足 API 的格式要求（每个 tool call 必须有对应的 result），二是给模型一个信号 — 这个工具调用的结果是不可靠的，模型应该考虑重新调用或采取其他策略。
 
+### 收尾分支：以未回复 tool call 结尾的转录
+
+前面两种合成都发生在"中间"——孤立的 tool call 后面还跟着新的 assistant 或 user 消息。v0.69.0 起还补上了第三种情形：整段转录**以一条尚未回复的 assistant tool call 结尾**（既没有后续 result，也没有后续消息触发合成）。这在直接重放低层历史（history replay）时会出现——例如恢复一个在工具执行途中被中断的会话。此时 `transformMessages` 会在序列**末尾**追加合成的 tool result，确保即便是最后一条消息也满足 `assistant(tool_call) → toolResult` 的闭合要求，否则下一次 provider 调用会因末尾悬空的 tool call 而报错。
+
 ## 具体例子：从 Claude 到 GPT 的消息变换
 
 以下是一个 3 消息对话在跨模型变换前后的对比。假设用户在 Claude（`claude-sonnet-4-6`）上进行了对话，现在要切换到 GPT（`gpt-4o`）。
@@ -321,7 +325,7 @@ if (assistantMsg.stopReason === "error"
   { "role": "user", "content": "查看 src/main.rs 的内容" },
   {
     "role": "assistant",
-    "provider": "anthropic", "api": "messages",
+    "provider": "anthropic", "api": "anthropic-messages",
     "model": "claude-sonnet-4-6",
     "content": [
       { "type": "thinking",
@@ -353,7 +357,7 @@ if (assistantMsg.stopReason === "error"
   { "role": "user", "content": "查看 src/main.rs 的内容" },
   {
     "role": "assistant",
-    "provider": "anthropic", "api": "messages",
+    "provider": "anthropic", "api": "anthropic-messages",
     "model": "claude-sonnet-4-6",
     "content": [
       { "type": "text",
@@ -445,6 +449,7 @@ if (assistantMsg.stopReason === "error"
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。`transformMessages` 的策略随 provider 的增加
+> 本章核心分析基于 pi-mono v0.66.0，截至 v0.79.7 整体策略未变。`transformMessages` 的策略随 provider 的增加
 > 不断演进：redacted thinking 处理、thoughtSignature 清理、合成 tool result 都是
-> 在遇到实际 API 错误后逐步添加的防御措施。
+> 在遇到实际 API 错误后逐步添加的防御措施。v0.69.0 补充了"以未回复 tool call 结尾"的收尾合成分支（见上文）。
+> 注意：跨模型示例中的 `api` 字段值是 `"anthropic-messages"`（与 `KnownApi` 一致），早期草稿误写为 `"messages"`。

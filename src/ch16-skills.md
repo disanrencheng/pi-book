@@ -76,13 +76,15 @@ tests are feasible. Especially important for:
 - If a test is hard to write, the interface needs redesigning
 ```
 
-Frontmatter 中的 `name` 必须匹配父目录名（如 `skills/tdd/SKILL.md`）。`description` 是注入 system prompt 的部分 — 它是 LLM 决定"要不要读这个 skill"的唯一依据，所以应该包含足够的触发条件信息。
+Frontmatter 中的 `name` **约定上**应与父目录名一致（如 `skills/tdd/SKILL.md`）。注意从 v0.74.1 起这只是约定而非强制 —— `name` 与目录名不一致**不再产生诊断告警**（详见下文名称验证）。`description` 是注入 system prompt 的部分 — 它是 LLM 决定"要不要读这个 skill"的唯一依据，所以应该包含足够的触发条件信息。
 
 正文（`## When to use` 以下）不会自动注入 prompt — 只有当 LLM 认为当前任务匹配 description 时，它会用 `read` 工具读取完整文件。
 
-### disable-model-invocation
+### disable-model-invocation 与显式触发
 
 当 `disable-model-invocation: true` 时，skill 不会出现在 system prompt 的 `<available_skills>` 列表中，LLM 无法自动发现和加载它。这类 skill 只能通过用户的 `/skill:name` 命令显式触发。适用场景：包含敏感指令、或只在特定上下文中才有意义的 skill。
+
+显式触发时 skill 的内容**如何进入对话**也经过了设计。`/skill:name` 不是简单地把 skill 全文塞进去，而是用一段 **XML wrapper 把 skill 指令与用户本轮消息包裹在一起**注入（v0.73.1 引入，v0.79.0 修复了指令与用户消息之间的空行间距，#5371）。这样模型能清楚区分"这是被显式激活的 skill 指令"与"这是用户的请求"，而不会把两者混成一团。相应地，HTML 会话导出会**剥离这层 skill wrapper XML**（#4234），避免它出现在给人看的渲染结果里 —— 又一次"机器可靠识别用 XML 边界、但对人隐藏标记"的取舍（参见第 14 章 `<project_context>`）。
 
 ## Frontmatter 解析
 
@@ -186,12 +188,9 @@ skills/
 ### 名称验证
 
 ```typescript
-// skills.ts:92-116
-function validateName(name: string, parentDirName: string): string[] {
+// skills.ts:92-112
+function validateName(name: string): string[] {
   const errors: string[] = [];
-  if (name !== parentDirName) {
-    errors.push(`name does not match parent directory`);
-  }
   if (name.length > MAX_NAME_LENGTH) {  // 64
     errors.push(`name exceeds ${MAX_NAME_LENGTH} characters`);
   }
@@ -208,7 +207,9 @@ function validateName(name: string, parentDirName: string): string[] {
 }
 ```
 
-名称规则严格但合理：小写字母、数字、连字符，最长 64 字符，不能以连字符开头或结尾，不能有连续连字符。这些约束确保 skill 名可以安全地用作文件路径、命令名、XML 标签。
+名称规则：小写字母、数字、连字符，最长 64 字符，不能以连字符开头或结尾，不能有连续连字符。这些约束确保 skill 名可以安全地用作文件路径、命令名、XML 标签。
+
+> **订正（v0.74.1）**：早期 `validateName` 还接收 `parentDirName` 参数并检查 `name !== parentDirName`，对"名称与父目录不一致"报告诊断。这条检查已被移除 —— 名称与目录名一致现在是**约定而非强制**，不一致不再告警。`validateName` 的签名也相应简化为只接收 `name`。
 
 注意：验证失败只产生 warning，不阻止加载（除非 description 完全缺失）。这是"宽松输入、严格输出"的策略 — 让开发者的 skill 能用，但提醒他们规范命名。
 
@@ -351,8 +352,6 @@ pi 的判断：对于大多数 agent 的"能力扩展"需求，**告诉 LLM 怎�
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。Skill 机制自引入以来保持简洁。
-> Frontmatter 的字段限制（name 最长 64 字符、description 最长 1024 字符）
-> 是后来为防止滥用而添加的。npm 包中的 skill 发现是近期扩展。
-> `disable-model-invocation` 字段是后来添加的，用于区分"LLM 可自动发现"
-> 和"仅用户可显式触发"两种 skill。
+> 本章核心分析基于 pi-mono v0.66.0，已校订至 v0.79.7。Skill 机制自引入以来保持简洁：六字段接口、三条发现规则、全局优先于项目、XML 注入均不变。
+> 主要变化：① 名称验证放宽（v0.74.1）—— `name` 与父目录名不一致不再告警，`validateName` 签名简化；② 显式 `/skill:name` 触发用 XML wrapper 包裹 skill 指令与用户消息（v0.73.1，间距修复 v0.79.0/#5371），HTML 导出会剥离该 wrapper（#4234）。
+> Frontmatter 字段限制（name ≤64、description ≤1024）、npm 包 skill 发现、`disable-model-invocation` 区分自动/显式触发均保持。

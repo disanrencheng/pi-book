@@ -55,15 +55,38 @@ export class Editor implements Component, Focusable {
 Editor 的自动补全通过 `AutocompleteProvider` 接口和外部系统对接：
 
 ```typescript
-// packages/tui/src/autocomplete.ts (接口定义)
+// packages/tui/src/autocomplete.ts:243-269
 export interface AutocompleteProvider {
+  /** 在 token 边界自然触发本 provider 的字符。 */
+  triggerCharacters?: string[];
+
   getSuggestions(
-    text: string,
-    cursorPosition: number,
-    signal: AbortSignal,
+    lines: string[],
+    cursorLine: number,
+    cursorCol: number,
+    options: { signal: AbortSignal; force?: boolean },
   ): Promise<AutocompleteSuggestions | null>;
+
+  applyCompletion(/* ...替换文本并返回新光标... */): {
+    lines: string[];
+    cursorLine: number;
+    cursorCol: number;
+  };
+
+  /** 显式 Tab 补全时是否应触发文件补全。 */
+  shouldTriggerFileCompletion?(
+    lines: string[], cursorLine: number, cursorCol: number
+  ): boolean;
 }
 ```
+
+这个接口比早期版本扩展了不少，每个新增字段都对应一个真实的交互需求：
+
+- `getSuggestions` 的入参从早期的 `(text, cursorPosition, signal)` 改成了 `(lines, cursorLine, cursorCol, options)` —— 多行编辑下"光标位置"必须用行号+列号表达，单一偏移量不够；`options.force` 取代了外部的模式标志。
+- `triggerCharacters`（v0.79.1，[#4703](https://github.com/earendil-works/pi/issues/4703)）声明哪些字符在 token 边界自然触发本 provider，比如 `#`、`$`。Editor 据此决定何时不等 Tab 就主动唤起补全。
+- `shouldTriggerFileCompletion`（v0.69.0）让 provider 自己判断"此刻按 Tab 是否该做文件路径补全"，把这个上下文敏感的决策下放给 provider，而不是写死在 Editor 里。
+
+与之配套，`SlashCommand` 接口也新增了 `argumentHint?`（v0.67.6，`autocomplete.ts:230`）—— 斜杠命令可以声明参数提示（如 `/model <name>`），补全列表渲染时显示出来。
 
 补全触发有两种模式：
 
@@ -172,8 +195,10 @@ IME（Input Method Editor）是中日韩文输入的基础设施。终端中的 
 Editor 的 word wrap 不是简单的"按宽度截断"。它需要考虑：
 
 - **Unicode 字符宽度**：CJK 字符宽 2 列，拉丁字符宽 1 列，emoji 可能宽 2 列
-- **换行点选择**：优先在空格处换行，其次在标点处换行，最后才强制在字符边界换行
+- **换行点选择**：优先在空格处换行，其次在标点处换行，最后才强制在 **grapheme 边界**换行
 - **Paste marker**：作为原子单元不能被换行拆开（除非宽度超过整行）
+
+这里的"字符边界"在 v0.79.x 被收紧为 **grapheme（字素簇）边界**（[#5495](https://github.com/earendil-works/pi/issues/5495) 等）。原因是：强制换行如果落在一个多码位 grapheme（如带变音符的字母、emoji ZWJ 序列）的中间，会把一个视觉字符劈成两半，渲染错乱。Editor 用 `getGraphemeSegmenter()`（包装 `Intl.Segmenter`，`editor.ts:9,18`）先把行切成 grapheme，换行只在 grapheme 之间发生。这一改动同时修复了旧版本 CJK 文本换行时右侧出现的大段空隙问题。Unicode 词边界的导航与删除（`Ctrl+←/→`、按词删除）则由 `word-navigation.ts` 的 `findWordBackward`/`findWordForward` 基于 `Intl.Segmenter` 的 word 分词实现。
 
 ```typescript
 // packages/tui/src/components/editor.ts:101-108
@@ -235,6 +260,10 @@ Editor 实现了 Emacs 风格的 kill ring — `Ctrl+K` 杀掉光标到行尾的
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。Editor 组件是 pi-tui 中变化最频繁的组件 —
+> 本章核心分析基于 pi-mono v0.66.0，已对照 v0.79.7 核实。Editor 组件是 pi-tui 中变化最频繁的组件 —
 > 几乎每个版本都有交互改进或 bug 修复。Paste marker 机制是后来添加的，
 > 早期版本会直接将大粘贴内容全部显示在编辑器中。
+>
+> v0.66 → v0.79 的主要变化：`AutocompleteProvider` 接口扩展 —— `getSuggestions` 改为多行签名 `(lines, cursorLine, cursorCol, options)`，
+> 新增 `triggerCharacters`（v0.79.1，#4703）与 `shouldTriggerFileCompletion`（v0.69.0），`SlashCommand` 新增 `argumentHint`（v0.67.6）；
+> word wrap 收紧为按 grapheme 边界断行（v0.79.x，#5495），修复 CJK 换行大尾隙；新增基于 `Intl.Segmenter` 的 Unicode 词边界导航/删除（`word-navigation.ts`）。

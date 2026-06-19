@@ -52,9 +52,9 @@
 | `packages/coding-agent/src/modes/interactive/theme/theme.ts` | UI 主题 |
 | `packages/ai/src/models.generated.ts` | 自动生成的模型目录 |
 | `packages/coding-agent/src/core/export-html/` | HTML 导出，工程实现 |
-| `packages/tui/src/components/list.ts` | 列表组件渲染，UI 细节 |
-| `packages/web-ui/src/components/` | Web 组件，另一种 UI 实现 |
-| `packages/mom/src/slack/` | Slack API 对接，平台细节 |
+| `packages/tui/src/components/select-list.ts` | 列表组件渲染，UI 细节 |
+| `packages/coding-agent/src/modes/rpc/` | RPC 模式，另一种宿主实现 |
+| `packages/coding-agent/src/core/extensions/loader.ts` | Extension 加载机制，工程实现 |
 
 这些文件不是不重要 — 它们只是不应该**先**读。它们是"设计的消费者"，不是"设计本身"。
 
@@ -129,7 +129,7 @@ graph TD
 
 **跟着类型走**。`agent/src/types.ts` 定义了 `AgentMessage`、`AgentEvent`、`AgentTool`、`AgentLoopConfig` — 这些类型串起了整个系统。从类型出发，看哪些函数使用它们。
 
-**用搜索代替目录浏览**。pi-mono 有 298 个源文件。逐文件浏览效率极低。更好的策略是：找到一个你关心的类型或函数名，在整个仓库中搜索它的使用处。工具推荐：`grep -rn "AgentTool" packages/`。
+**用搜索代替目录浏览**。pi-mono 有约 200 个源文件（4 个包，coding-agent 占大头）。逐文件浏览效率极低。更好的策略是：找到一个你关心的类型或函数名，在整个仓库中搜索它的使用处。工具推荐：`grep -rn "AgentTool" packages/`。
 
 ## 常见阅读误区
 

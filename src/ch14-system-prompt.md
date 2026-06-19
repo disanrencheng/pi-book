@@ -109,13 +109,11 @@ const addGuideline = (guideline: string): void => {
 const hasBash = tools.includes("bash");
 const hasGrep = tools.includes("grep");
 const hasFind = tools.includes("find");
+const hasLs = tools.includes("ls");
 
-// 根据可用工具组合生成不同的指引
+// 只在"没有专用探索工具、只能靠 bash"时才给出指引
 if (hasBash && !hasGrep && !hasFind && !hasLs) {
   addGuideline("Use bash for file operations like ls, rg, find");
-} else if (hasBash && (hasGrep || hasFind || hasLs)) {
-  addGuideline("Prefer grep/find/ls tools over bash for file exploration " +
-    "(faster, respects .gitignore)");
 }
 
 // 注入 extension 提供的额外指引
@@ -130,6 +128,8 @@ addGuideline("Show file paths clearly when working with files");
 ```
 
 去重机制（`guidelinesSet`）确保即使 extension 提供的 guideline 和内建的重复，也不会出现两次。guideline 的注入顺序是：工具相关的指引 → extension 提供的指引 → 通用指引。
+
+> **设计演化（v0.77.0）**：早期版本里这里还有一个 `else if` 分支 —— 当 grep/find/ls 这些专用工具可用时，注入一条"优先用 grep/find/ls 而不是 bash 做文件探索（更快、尊重 .gitignore）"的指引。这条指引后来被删除了。原因是它属于"用 prompt 教模型挑工具"，而 pi 的判断是：工具的取舍应该由**工具是否被注册**来表达，而不是靠一句容易被忽略的自然语言指引。现在只保留了反向的兜底分支 —— 当一个会话**只有 bash、没有任何专用探索工具**时，才明确告诉模型用 bash 去做 ls/rg/find。换句话说，prompt 不再替模型在"bash vs grep"之间做选择，它只在"无专用工具可用"这一种情形下补一句话。
 
 ### 默认 Prompt 的完整结构
 
@@ -173,25 +173,30 @@ if (appendSection) {
 }
 ```
 
-这是一个"轻量级定制"入口 — 不需要替换整个 system prompt，只需要追加额外的规则。
+这是一个"轻量级定制"入口 — 不需要替换整个 system prompt，只需要追加额外的规则。命令行上 `--append-system-prompt` 可以多次传入并依次叠加，而不是后者覆盖前者。
+
+> **装配输入可被扩展检视（v0.68.0 / v0.78.1）**：装配 `buildSystemPrompt` 的那组输入（即 `BuildSystemPromptOptions`）会在 `before_agent_start` 事件中以 `systemPromptOptions` 暴露给 extension，extension 也能通过 `ctx.getSystemPromptOptions()` 主动读取。这让"prompt 由谁拼出来"从黑盒变成可观测、可介入的装配流程。相关的还有两个 CLI 开关：`--no-context-files`（跳过 AGENTS.md/CLAUDE.md 的发现与注入）和 `cwd` 现在是 `buildSystemPrompt` 的**必填**参数 —— 不再回退到 `process.cwd()`，调用方必须显式传入工作目录（这条"去 process-global"的纪律贯穿 pi 的多个子系统，详见第 17 章）。
 
 ## Context Files 注入
 
 无论是默认 prompt 还是自定义 prompt，context files（AGENTS.md / CLAUDE.md）的注入逻辑相同：
 
 ```typescript
-// packages/coding-agent/src/core/system-prompt.ts:149-156
+// packages/coding-agent/src/core/system-prompt.ts:153-160
 
 if (contextFiles.length > 0) {
-  prompt += "\n\n# Project Context\n\n";
-  prompt += "Project-specific instructions and guidelines:\n\n";
+  prompt += "\n\n<project_context>\n\n";
   for (const { path: filePath, content } of contextFiles) {
-    prompt += `## ${filePath}\n\n${content}\n\n`;
+    prompt += `<project_instructions path="${filePath}">\n` +
+      `${content}\n</project_instructions>\n\n`;
   }
+  prompt += "</project_context>\n";
 }
 ```
 
-每个 context file 作为一个独立的 section 注入，用文件路径作为标题。这样 LLM 能看到规则来自哪个文件，有助于在规则冲突时理解优先级。
+每个 context file 作为一个独立的 `<project_instructions>` 块注入，文件路径放在 `path` 属性里，整体再包进一个 `<project_context>` 标签。这样 LLM 能看到规则来自哪个文件，有助于在规则冲突时理解优先级。
+
+> **设计演化（v0.75.0）**：早期版本用 Markdown 标题包裹项目上下文 —— `# Project Context` 作为大标题，每个文件用 `## ${path}` 作为二级标题。问题在于：当 `AGENTS.md` 自身的内容里也含有 Markdown 标题（几乎必然如此）时，模型很难分清哪些标题是"边界标记"、哪些是"文件内容"。改用 XML 标签后，边界有了明确且不会与 Markdown 正文混淆的开闭标记。这与下文 skills 注入用 `<available_skills>` 是同一个判断 —— **prompt 里凡是需要机器可靠识别的边界，一律用 XML 标签，不用 Markdown 标题**。
 
 context files 的加载顺序（在第 13 章详述）决定了它们在 prompt 中的顺序 — 全局在前，当前目录在后。由于 LLM 的近因偏差（recency bias），后面的内容通常更受重视，这恰好与我们的优先级期望一致：目录级规则 > 项目级规则 > 全局规则。
 
@@ -295,13 +300,14 @@ if (customPrompt) {
   // 追加 appendSystemPrompt
   if (appendSection) prompt += appendSection;
 
-  // 追加项目上下文文件
+  // 追加项目上下文文件（同样用 XML 标签包裹）
   if (contextFiles.length > 0) {
-    prompt += "\n\n# Project Context\n\n";
-    prompt += "Project-specific instructions and guidelines:\n\n";
+    prompt += "\n\n<project_context>\n\n";
     for (const { path, content } of contextFiles) {
-      prompt += `## ${path}\n\n${content}\n\n`;
+      prompt += `<project_instructions path="${path}">\n` +
+        `${content}\n</project_instructions>\n\n`;
     }
+    prompt += "</project_context>\n";
   }
 
   // 追加 skills（需要 read 工具可用）
@@ -396,8 +402,9 @@ Prompt 装配是 pi 产品层的"信息入口" — 它决定了 LLM 在整个会
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。Prompt 装配的来源随产品演进不断增加：
-> skills 支持、prompt templates、extension 追加文本都是后来添加的。
-> `buildSystemPrompt` 的纯函数设计（不做 I/O）自始至终保持不变。
-> `formatSkillsForPrompt` 使用 XML 格式注入 skill 列表，这个格式在多次实验后被选中。
-> `APPEND_SYSTEM.md` 是后来添加的，作为 SYSTEM.md 完全替换的轻量级替代方案。
+> 本章核心分析基于 pi-mono v0.66.0，已校订至 v0.79.7。截至 v0.79.7，prompt 装配有两处设计级变化：
+> ① 项目上下文的边界从 Markdown 标题（`# Project Context` / `## ${path}`）改为 XML 标签
+> （`<project_context>` / `<project_instructions path="...">`，v0.75.0），动机是避免与 AGENTS.md 正文里的标题混淆 —— 这与 skills 注入用 `<available_skills>` 是同一判断。
+> ② "优先用 grep/find/ls 而非 bash"的指引在 v0.77.0 被删除，prompt 不再替模型在工具间做选择，只在"仅有 bash"时兜底。
+> 此外，装配输入在 `before_agent_start` 通过 `systemPromptOptions` 暴露给 extension（v0.68.0），`cwd` 成为必填（去 process.cwd() 兜底）。
+> `buildSystemPrompt` 的纯函数设计（不做 I/O）、`formatSkillsForPrompt` 的 XML 注入、`APPEND_SYSTEM.md` 轻量追加这三点自始至终保持不变。

@@ -316,6 +316,8 @@ export interface AssistantMessage {
   provider: Provider;
   model: string;
   responseId?: string;
+  responseModel?: string;   // 路由后的实际模型（如 OpenRouter auto）
+  diagnostics?: AssistantMessageDiagnostic[]; // 脱敏的失败/恢复诊断
   usage: Usage;
   stopReason: StopReason;
   errorMessage?: string;
@@ -331,6 +333,8 @@ export interface AssistantMessage {
 - **`provider: Provider`** — 使用的 provider，如 `"anthropic"` 或 `"openai"`。
 - **`model: string`** — 实际使用的模型名称，如 `"claude-sonnet-4-20250514"`。
 - **`responseId?: string`** — 上游 API 返回的响应标识符（可选）。不同 provider 的含义不同。
+- **`responseModel?: string`** — 当上游路由后的实际模型与请求的 `model` 不同时填充（如 OpenRouter 的 `auto` 路由到 `anthropic/...`，v0.71.0 引入）。`model` 是"请求了什么"，`responseModel` 是"实际跑了什么"。
+- **`diagnostics?: AssistantMessageDiagnostic[]`** — 脱敏后的 provider/runtime 诊断，记录这次响应过程中的失败与恢复（如重试、降级），用于可观测性而不泄露敏感请求内容（v0.59.0 起）。
 - **`usage: Usage`** — token 使用统计，包含 `input`、`output`、`cacheRead`、`cacheWrite`、`totalTokens`，以及对应的 `cost` 计算。
 - **`stopReason: StopReason`** — 停止原因。类型为 `"stop" | "length" | "toolUse" | "error" | "aborted"`，与终止事件的 reason 对应。
 - **`errorMessage?: string`** — 当 `stopReason` 为 `"error"` 或 `"aborted"` 时，携带错误描述。
@@ -346,6 +350,7 @@ export interface Usage {
   output: number;
   cacheRead: number;
   cacheWrite: number;
+  cacheWrite1h?: number; // Anthropic 1 小时缓存写入的子集
   totalTokens: number;
   cost: {
     input: number;
@@ -357,7 +362,7 @@ export interface Usage {
 }
 ```
 
-`Usage` 同时记录 token 数量和费用。`cacheRead` 和 `cacheWrite` 是 prompt caching 相关的统计 — 不是所有 provider 都支持，不支持的填 0。`cost` 嵌套对象把 token 数量按各 provider 的价格转换成了美元金额，让上层不需要知道定价细节。
+`Usage` 同时记录 token 数量和费用。`cacheRead` 和 `cacheWrite` 是 prompt caching 相关的统计 — 不是所有 provider 都支持，不支持的填 0。`cacheWrite1h` 是后来新增的字段：它从 `cacheWrite` 中拆出"写入 1 小时 TTL 缓存"的那部分 token，目前只有 Anthropic 上报（用于更精确的缓存计费，v0.79.4）。`cost` 嵌套对象把 token 数量按各 provider 的价格转换成了美元金额，让上层不需要知道定价细节。
 
 ## 一次典型 LLM 响应的事件序列
 
@@ -434,9 +439,24 @@ sequenceDiagram
 
 **4. `partial` 的内存开销**。每个中间事件都携带完整的 `partial` AssistantMessage 快照。对于一个长回答，可能有数百个 delta 事件，每个都带一份完整快照。这是用内存换取消费者的简单性。
 
+## `StreamOptions`：事件流之下的扩展点
+
+事件流的"形状"稳定，但**发起一次流**的入口 `StreamOptions` 随版本显著扩张（`types.ts:90-165`）。这些字段不改变事件协议，而是在协议之下提供 hook 和传输层旋钮：
+
+- **`transport?: Transport`** — `"sse" | "websocket" | "websocket-cached" | "auto"`。事件流是上层抽象，底下走什么传输由它决定。`websocket-cached`（v0.71.1）让 OpenAI Codex Responses 用一条保活的 WebSocket 连接跨请求只发送**新增**的对话项，而不是每次重发整个上下文 —— 事件流的消费者完全无感。
+- **`onPayload?`** — 在请求发出**前**改写 provider payload（由早期的 beforeProviderRequest 演化而来），用于注入自定义头部、改写参数。
+- **`onResponse?`** — 在拿到响应后读取 HTTP 状态码与响应头（v0.67.6），用于配额提示、调试。
+- **`env?`** — provider 级的环境变量覆盖（v0.79.5），让同一进程内不同请求使用不同的 API key / 代理 / 区域占位符（Cloudflare、Azure、Vertex、Bedrock）。
+- 还有 `timeoutMs` / `maxRetries` / `maxRetryDelayMs` / `cacheRetention` / `sessionId` / `metadata` 等运行时旋钮。
+
+这是 pi-ai 的一条设计主线：**事件流契约对上不变，传输与拦截能力对下生长**。消费者面对的永远是同一套 12 种事件，而 provider 与上层产品通过 `StreamOptions` 协商越来越多的细节。
+
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。事件流设计自 pi-ai 创建以来是最稳定的部分。
-> `EventStream` 类的实现几乎没有改变。事件类型随 provider 能力的增加而扩展
-> （比如 `thinking_start/delta/end` 是后来为支持 extended thinking 而添加的）。
+> 本章核心分析基于 pi-mono v0.66.0，截至 v0.79.7 事件协议与 `EventStream` 类几乎未变 —— 这是 pi-ai 最稳定的部分。变化集中在数据模型与入口选项：
+> - `AssistantMessage` 新增 `responseModel`（v0.71.0）、`diagnostics`（v0.59.0）。
+> - `Usage` 新增 `cacheWrite1h`（v0.79.4）。
+> - `StreamOptions` 大幅扩展（transport / onPayload / onResponse / env 等，见上节）。
+> - 事件类型随 provider 能力增加而扩展（如 `thinking_start/delta/end` 为 extended thinking 而加）。
+> 对比：v0.74.1 新增的图像生成走的是 `Promise` 而非事件流（详见第 18 章），正好反衬"为什么文本生成需要事件流"。

@@ -6,13 +6,11 @@
 
 ## bash 是后备，不是首选
 
-pi 的 system prompt 中有一条明确的指引：
+bash 在 pi 里的定位是**万能后备**：用于没有专用工具覆盖的操作 — 安装依赖、运行测试、启动服务、执行 git 命令。读文件该用 read、编辑用 edit、搜索用 grep、查找文件用 find。
 
-> "Do NOT use Bash to run commands when a relevant dedicated tool is provided."
+值得注意的是这个"后备"定位**如何被表达**。早期版本里，pi 的 system prompt 直接写着一条"当有专用工具时不要用 bash"的指引；到 v0.77.0，这类"用 prompt 教模型挑工具"的文字被删除了（详见第 14 章）。现在的判断是：工具的取舍应当由"**哪些工具被激活**"来表达 —— 如果一个会话同时激活了 grep/find/ls 和 bash，模型自然会用更顺手、反馈更好的结构化工具；只有在"仅有 bash、没有专用探索工具"时，prompt 才补一句让它用 bash 去做 ls/rg/find。bash 工具自己的 promptSnippet 也回归中性（`"Execute bash commands (ls, grep, find, etc.)"`，bash.ts:280）。
 
-然后列举了具体的替代关系：读文件用 Read、编辑用 Edit、搜索用 Grep、查找文件用 Glob。bash 只用于"没有专用工具覆盖的操作" — 安装依赖、运行测试、启动服务、执行 git 命令。
-
-这个优先级顺序不是审美偏好，而是工程约束：结构化工具有参数校验、自动截断、跨平台一致性，bash 没有。LLM 用 bash 搜索文件时可能忘记排除 `node_modules`，可能用了 macOS 特有的 `find` 参数，可能返回几万行输出。结构化工具替它兜住了这些风险。
+为什么倾向结构化工具不是审美偏好，而是工程约束：结构化工具有参数校验、自动截断、跨平台一致性，bash 没有。LLM 用 bash 搜索文件时可能忘记排除 `node_modules`，可能用了 macOS 特有的 `find` 参数，可能返回几万行输出。结构化工具替它兜住了这些风险。
 
 ## Schema 定义：极简但完整
 
@@ -194,6 +192,31 @@ const BASH_PREVIEW_LINES = 5;
 
 折叠状态下，用户可以展开查看完整输出。这个 UX 设计平衡了"不丢失信息"和"不让长输出淹没对话流"两个需求。
 
+## `excludeFromContext`：执行但不进上下文（v0.76.0）
+
+有一类命令用户想**执行并看到输出，但不希望它进入 LLM 的上下文** —— 典型的是 `cat 一个很大的日志`、`env`（含敏感变量）、或纯粹给人看的探查命令。把这些塞进上下文既浪费 token，又可能污染后续推理。v0.76.0 为此加了 `excludeFromContext`。
+
+```typescript
+// packages/coding-agent/src/core/agent-session.ts:2595-2598, 2639
+async executeBash(
+  command: string,
+  onChunk?: (chunk: string) => void,
+  options?: { excludeFromContext?: boolean; operations?: BashOperations },
+): Promise<BashResult> { /* ... */ }
+
+// 结果记录到会话时带上该标记：
+recordBashResult(command, result, options): void {
+  const bashMessage: BashExecutionMessage = {
+    role: "bashExecution", command, output: result.output,
+    /* ... */ excludeFromContext: options?.excludeFromContext,
+  };
+}
+```
+
+交互界面上对应的语法是 **`!!` 前缀** —— 用户输入 `!!` 开头的命令时，它照常执行、输出照常显示在 TUI 里，但这条 `bashExecution` 记录被标记为 `excludeFromContext: true`，在装配发给 LLM 的上下文时被跳过。注意它**仍然写入会话文件**（持久化与"是否发给模型"是两个正交维度，呼应第 11 章的会话模型）。RPC 模式下 `bash` 命令也透传这个选项（见第 26 章）。
+
+另外两点与上下文相关的细节：bash 的输出从 v0.73.0 起**增量地进入模型上下文**（流式 chunk 边产生边累积，而非命令结束才一次性塞入），进程退出后还会继续 drain stdout/stderr 以免丢尾部输出；`shellPath` 与工作目录都跟随**会话当前 cwd**（`sessionManager.getCwd()`，agent-session.ts:2610），而非 pi 启动时的目录 —— 又一次"去 process-global"。
+
 ## 取舍分析
 
 ### 得到了什么
@@ -211,6 +234,9 @@ const BASH_PREVIEW_LINES = 5;
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。Bash 工具的输出处理经历了多次改进 —
-> 包括输出截断策略（tailTruncation）、`BashSpawnHook` 的引入、
-> 以及 `fullOutputPath` 临时文件机制。
+> 本章核心分析基于 pi-mono v0.66.0，已校订至 v0.79.7。Bash 工具的输出处理经历多次改进 —
+> 输出 tail 截断、`BashSpawnHook`、`fullOutputPath` 临时文件机制均保持。
+> 主要设计级变化：① `excludeFromContext`（`!!` 前缀，v0.76.0）—— 命令执行并显示但输出不入 LLM 上下文；
+> ② 输出从 v0.73.0 起增量进入上下文，进程退出后继续 drain（v0.79.4）；
+> ③ `shellPath`/cwd 跟随会话当前 cwd 而非启动 cwd（v0.68.0）。
+> 此外 system prompt 不再硬性指引"有专用工具时勿用 bash"（v0.77.0，详见第 14 章）。

@@ -171,6 +171,8 @@ export function generateDiffString(
   // 输出格式：+行号 添加的行 / -行号 删除的行 / 空格行号 上下文
 ```
 
+除了给 LLM 看的带行号 diff，edit 执行后还会用 `generateUnifiedPatch(path, baseContent, newContent)` 生成一份**标准 unified patch** 附在结果 details 里（edit.ts:350-351）。这让下游（IDE 扩展、外部工具）可以拿到能直接 `git apply` 的补丁，而不必自己解析带行号的展示型 diff。从 v0.79.7 起，`generateDiffString`、`generateUnifiedPatch`、`EditDiffResult` 已作为**公共 API 从包根导出**（index.ts:249）—— edit 的 diff 能力不再是工具内部细节，而是可被 extension/SDK 复用的构件。
+
 ## `file-mutation-queue`：并发安全
 
 当 LLM 在 parallel 模式下同时发起多个 edit 调用（比如"同时修改 3 个文件"），可能有两个 edit 操作指向同一个文件。`file-mutation-queue` 确保同一个文件的写操作被串行化：
@@ -289,25 +291,34 @@ match exactly including all whitespace and newlines.
 edit 工具的 `prepareArguments` 钩子处理一个历史遗留问题。早期的 API 使用顶层的 `oldText` / `newText` 参数而非 `edits[]` 数组：
 
 ```typescript
-// packages/coding-agent/src/core/tools/edit.ts:83-97
+// packages/coding-agent/src/core/tools/edit.ts:95-117
 
 function prepareEditArguments(input: unknown): EditToolInput {
-  if (!input || typeof input !== "object") {
-    return input as EditToolInput;
+  if (!input || typeof input !== "object") return input as EditToolInput;
+  const args = input as Record<string, unknown>;
+
+  // 有些模型（Opus 4.6、GLM-5.1）把 edits 当成 JSON 字符串发来，先 parse
+  if (typeof args.edits === "string") {
+    try {
+      const parsed = JSON.parse(args.edits);
+      if (Array.isArray(parsed)) args.edits = parsed;
+    } catch {}
   }
-  const args = input as LegacyEditToolInput;
-  if (typeof args.oldText !== "string"
-    || typeof args.newText !== "string") {
-    return input as EditToolInput;
+
+  const legacy = args as LegacyEditToolInput;
+  if (typeof legacy.oldText !== "string"
+    || typeof legacy.newText !== "string") {
+    return args as EditToolInput;
   }
   // 把旧格式的 oldText/newText 合并到 edits 数组
-  const edits = Array.isArray(args.edits)
-    ? [...args.edits] : [];
-  edits.push({ oldText: args.oldText, newText: args.newText });
-  const { oldText: _oldText, newText: _newText, ...rest } = args;
+  const edits = Array.isArray(legacy.edits) ? [...legacy.edits] : [];
+  edits.push({ oldText: legacy.oldText, newText: legacy.newText });
+  const { oldText: _oldText, newText: _newText, ...rest } = legacy;
   return { ...rest, edits } as EditToolInput;
 }
 ```
+
+注意开头新增的那段 JSON 字符串处理。`edits` 在 schema 里是数组，但实践中有些模型（注释里点名了 Opus 4.6、GLM-5.1）会把它**序列化成 JSON 字符串**再发出来。`prepareEditArguments` 在 schema 验证之前先尝试 `JSON.parse`，parse 成功且是数组就还原 —— 这是"宽容输入"原则对模型行为差异的又一次兜底，让同一个 edit 工具能容忍不同模型的 tool-call 习惯。
 
 这个函数在 schema 验证**之前**运行（见第 9 章 `prepareArguments` 钩子）。它检测旧格式并转换为新格式：
 
@@ -364,6 +375,5 @@ const defaultEditOperations: EditOperations = {
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。Edit 工具从"行号编辑"演变为"精确替换"
-> 是一个重要的设计转变 — `prepareArguments` 钩子（第 9 章）就是为了兼容旧版 API 而添加的。
-> 多 edit 支持（`edits[]` 数组）是后续迭代中加入的，早期只支持单次 `oldText` → `newText`。
+> 本章核心分析基于 pi-mono v0.66.0，已校订至 v0.79.7。Edit 从"行号编辑"演变为"精确替换"是重要的设计转变；`prepareArguments`（第 9 章）兼容旧版 API，`edits[]` 多编辑、fuzzy matching、行尾归一化、file-mutation-queue 均保持。
+> 主要演进：① `prepareArguments` 增加对 `edits` 为 JSON 字符串的容错（Opus 4.6/GLM-5.1 等模型，先 JSON.parse）；② 结果附带标准 unified patch，`generateDiffString`/`generateUnifiedPatch`/`EditDiffResult` 自 v0.79.7 起作为公共 API 导出。

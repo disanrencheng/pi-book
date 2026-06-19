@@ -50,7 +50,9 @@ interface SessionEntryBase {
 }
 ```
 
-`id` 是 8 位十六进制字符串，由 `randomUUID().slice(0, 8)` 生成，并通过碰撞检查确保唯一性。为什么不用完整的 UUID？因为这些 id 会出现在 TUI 的分支导航中，短 id 对人类更友好。`parentId` 指向前驱 entry 的 id，`null` 表示这是树的根节点（通常是用户的第一条消息）。
+这里要区分两种 id。**entry 的 id** 是 8 位十六进制字符串，由 `randomUUID().slice(0, 8)` 生成（session-manager.ts:218），并通过碰撞检查确保唯一性 —— 它们会出现在 TUI 的分支导航中，短 id 对人类更友好。`parentId` 指向前驱 entry 的 id，`null` 表示这是树的根节点（通常是用户的第一条消息）。
+
+而**会话本身的 id**（session header 里的 `id`）从 v0.67.1 起改用 **UUIDv7**（`createSessionId()` 返回 `uuidv7()`，session-manager.ts:204）。UUIDv7 是时间有序的 —— 这不是为了好看，而是为了让**基于 session 的请求路由具备时间局部性**：同一会话的 id 在时间上聚集，对 provider 端按 id 路由 + prompt 缓存命中更友好。两种 id 各司其职：会话 id 求全局唯一 + 时间有序，entry id 求短小可读。
 
 ```mermaid
 graph TD
@@ -155,7 +157,7 @@ interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
 
 **ModelChangeEntry** — 用户在对话中途切换了模型（如从 Claude Sonnet 切到 Claude Opus）。同样在路径遍历时被提取，恢复到最后一次切换的状态。
 
-**SessionInfoEntry** — 会话元数据，目前只有一个字段：`name`（用户自定义的会话显示名称）。这不是在树遍历中提取的，而是通过 `getSessionName()` 方法从后往前扫描最新的 `session_info` entry。
+**SessionInfoEntry** — 会话元数据，主要字段是 `name`（用户自定义的会话显示名称）。这不是在树遍历中提取的，而是通过 `getSessionName()` 方法从后往前扫描最新的 `session_info` entry。会话命名的写入路径后来扩展了：除了交互中重命名，还可以在启动时用 `--name` / `-n` 指定（覆盖 interactive/print/JSON/RPC 各模式），以及在 SDK/extension 里用 `pi.setSessionName()` 写入 —— 它们最终都落成一条 `session_info` entry。
 
 这三种类型的共同设计特点是：它们记录**事件**而非**状态**。不维护一个"当前配置"对象，而是把每次变更作为事件追加。最终状态通过重放事件得出。这是 event sourcing 的思想 — 在 append-only 的存储中，这是唯一合理的做法。
 
@@ -531,6 +533,16 @@ LLM 知道之前试过策略模式（通过 branch summary），但上下文中�
 
 整个过程中，JSONL 文件只做了 append 操作。原始的 10 行没有被修改或删除。分支操作的"成本"是 3 行新 entry（branch_summary + 2 条新消息），而不是复制前 6 行。这就是 `parentId` 树结构的核心价值：**分支是零拷贝的**。
 
+## 三种分支命令：/tree、/fork、/clone
+
+在这套数据模型之上，pi 暴露了三个语义不同的用户命令（interactive-mode.ts:2587-2597）：
+
+- **`/tree`** —— 在**同一个文件内**原地分支：追加一个 `parentId` 指向更早节点的新 entry，旧分支继续留在同一 JSONL 里（就是上面案例展示的零拷贝分支）。
+- **`/fork`** —— 从某条更早的 user 消息**开一个新文件**，常用于"我想从这里重新走一条路，但不想污染当前会话历史"。fork 支持 `position` 选项（`"before" | "at"`，interactive-mode.ts:4407）：`at` 从该消息处分叉，`before` 从它**之前**分叉（连这条 user 消息也重来）。
+- **`/clone`** —— 把**当前活动分支**复制到一个新文件，相当于"另存为"，保留当前这一条路径作为新会话的起点。
+
+`/tree` 是零拷贝的同文件分支，`/fork` 和 `/clone` 则产生新文件 —— 这正是上一节"提取单条路径到新文件"的两种入口。定位会话还多了两个自动化友好的入口：`--session-id <id>`（精确创建/恢复某个项目会话，args.ts:108）与 `PI_CODING_AGENT_SESSION_DIR` 环境变量（覆盖会话存储目录，args.ts:375）。
+
 ## 取舍分析
 
 ### 得到了什么
@@ -553,6 +565,8 @@ LLM 知道之前试过策略模式（通过 branch summary），但上下文中�
 
 `buildSessionContext()` 的时间复杂度是 O(N)（N = 总 entry 数），因为即使只需要一条路径，也要先构建 `byId` 索引。不过索引构建后，路径遍历本身是 O(D)（D = 树的深度，即路径长度）。
 
+> **订正（v0.78.1）**：早期 `/resume` 列出历史会话时，会把每个候选 JSONL **整文件读成字符串**再解析，会话一多就有 OOM 风险。现在改为**逐行流式读取**（`createInterface` + `for await (const line of rl)`，session-manager.ts:599-604），只解析定位会话列表所需的头部信息，不再把整个文件载入内存。注意这只改变了"浏览会话列表"的读取方式；**加载某个会话的完整上下文**仍需构建 `byId` Map（仍是 O(N)），上面的结论不变。此外，关闭会话时会 abort 在途的 agent / compaction / branch-summary / retry / bash（v0.77.0）。
+
 **2. 没有索引。** 不能按工具名、时间范围、文件路径等维度快速查询。全部依赖遍历。如果需要"找到所有修改了 auth.ts 的 tool call"，必须遍历所有 entry 并检查消息内容。
 
 **3. 文件会持续增长。** compaction 压缩了 LLM context，但 JSONL 文件中的原始 entry 仍然保留。一个长时间使用的 session 可能有几 MB 的 JSONL 文件。`createBranchedSession()` 提供了一种"修剪"方式 — 提取单条路径到新文件，丢弃其他分支。但这创建的是新 session，不是原地修剪。
@@ -566,7 +580,6 @@ LLM 知道之前试过策略模式（通过 branch summary），但上下文中�
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。Session 格式经历了 3 个版本：
-> v1（无 id/parentId，纯线性）→ v2（加入 id/parentId 树形结构）→ v3（当前，统一 custom 角色名）。
-> `CustomEntry`、`CustomMessageEntry`、`LabelEntry`、`SessionInfoEntry` 是后来添加的，
-> 为 extension 生态和用户体验提供扩展点。旧版 session 文件通过 `migrateV1ToV2` 和 `migrateV2ToV3` 自动升级。
+> 本章核心分析基于 pi-mono v0.66.0，已校订至 v0.79.7。9 种 entry、v1→v2→v3 迁移、parentId 树形零拷贝分支均不变。
+> 主要演进：① 会话 id 改用 UUIDv7（v0.67.1，时间有序，利于按 id 路由 + prompt 缓存）；② 命令三件套 `/tree`（同文件原地分支）、`/fork`（开新文件，支持 `position: before|at`）、`/clone`（复制当前分支到新文件）；③ `--session-id` 精确定位（v0.76.0）、`PI_CODING_AGENT_SESSION_DIR`（v0.71.0）；④ `/resume` 改为逐行流式读 JSONL（v0.78.1，防 OOM）。
+> `CustomEntry`、`CustomMessageEntry`、`LabelEntry`、`SessionInfoEntry` 为 extension 生态和用户体验提供扩展点；旧版 session 通过 `migrateV1ToV2`/`migrateV2ToV3` 自动升级。

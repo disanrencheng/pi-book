@@ -1,6 +1,6 @@
 # 第 7 章：OAuth — 统一认证的隐藏复杂度
 
-> **定位**：本章解析为什么一个 LLM 抽象层还要管认证，以及 5 种 OAuth 流程如何被统一。
+> **定位**：本章解析为什么一个 LLM 抽象层还要管认证，以及 3 种 OAuth 流程如何被统一。
 > 前置依赖：第 4 章（Provider Registry）。
 > 适用场景：当你想理解为什么认证不能推到产品层，或者想为 pi 添加新的 OAuth provider。
 
@@ -18,9 +18,9 @@
 
 这就是第 8 章介绍的 `AgentLoopConfig.getApiKey` 回调的设计理由。
 
-## 5 种 OAuth 流程的统一
+## 3 种 OAuth 流程的统一
 
-pi-ai 的 OAuth 模块位于 `packages/ai/src/utils/oauth/`，支持 5 种 provider：
+pi-ai 的 OAuth 模块位于 `packages/ai/src/utils/oauth/`，内建支持 3 种 provider：
 
 ```mermaid
 graph LR
@@ -30,18 +30,14 @@ graph LR
         GetKey["getApiKey(creds)"]
     end
 
-    subgraph "5 种实现"
+    subgraph "3 种实现"
         A["Anthropic\nClaude Pro/Max"]
         B["GitHub Copilot"]
-        C["Google Gemini CLI\nCloud Code Assist"]
-        D["Antigravity\nGemini 3 via Google Cloud"]
         E["OpenAI Codex\nChatGPT Plus"]
     end
 
     A --> Login
     B --> Login
-    C --> Login
-    D --> Login
     E --> Login
 
     style Login fill:#e3f2fd
@@ -49,7 +45,9 @@ graph LR
     style GetKey fill:#e8f5e9
 ```
 
-每种 provider 的 OAuth 流程差异巨大：Anthropic 用标准 PKCE 流程，GitHub Copilot 用 device code 流程，Google 系列用 Google Cloud OAuth + 本地回调服务器，OpenAI Codex 用 ChatGPT 的 session token。但对外暴露的接口是统一的。
+每种 provider 的 OAuth 流程差异巨大：Anthropic 用标准 PKCE 流程 + 本地回调服务器，GitHub Copilot 用 device code 流程，OpenAI Codex 用 ChatGPT 的 session token（并自 v0.77.0 起支持 device code 作为无头登录的替代）。但对外暴露的接口是统一的。
+
+> **版本提示**：v0.66 时内建 5 种 OAuth provider，v0.71.0 整体移除了 Google Gemini CLI 与 Antigravity（连同它们的 provider、模型、OAuth 实现一并删除），现为 3 种。
 
 ### `OAuthProviderInterface`：3 个核心方法统一一切
 
@@ -79,7 +77,7 @@ interface OAuthProviderInterface {
 
 设计要点：
 
-**`login` 通过回调与 UI 交互**。`OAuthLoginCallbacks` 提供了 `onAuth`（显示授权 URL）、`onPrompt`（请求用户输入）、`onProgress`（显示进度）、`onManualCodeInput`（手动输入授权码）。OAuth provider 不知道自己在终端还是浏览器里 — 它只管调回调。
+**`login` 通过回调与 UI 交互**。`OAuthLoginCallbacks` 提供了 `onAuth`（显示授权 URL）、`onDeviceCode`（展示设备码与验证地址）、`onPrompt`（请求用户输入）、`onSelect`（让用户从多个登录方式/账号中选择）、`onProgress`（显示进度）、`onManualCodeInput`（手动输入授权码）。OAuth provider 不知道自己在终端还是浏览器里 — 它只管调回调。
 
 **`OAuthCredentials` 是通用的**。必须有 `refresh`（刷新 token）、`access`（访问 token）、`expires`（过期时间戳），其余字段自由扩展（`[key: string]: unknown`）。每个 provider 可以存储自己的额外数据。
 
@@ -90,18 +88,23 @@ interface OAuthProviderInterface {
 `login` 方法需要和用户交互 — 打开浏览器、显示授权码、等待用户输入。但 OAuth provider 不应该知道自己运行在什么环境中。终端、Electron 窗口、Slack bot 的交互方式完全不同。`OAuthLoginCallbacks` 就是这层抽象：
 
 ```typescript
-// packages/ai/src/utils/oauth/types.ts:26-32
+// packages/ai/src/utils/oauth/types.ts:43-52
 
 export interface OAuthLoginCallbacks {
   onAuth: (info: OAuthAuthInfo) => void;
+  onDeviceCode: (info: OAuthDeviceCodeInfo) => void;     // 必填
   onPrompt: (prompt: OAuthPrompt) => Promise<string>;
-  onProgress?: (message: string) => void;
   onManualCodeInput?: () => Promise<string>;
+  onSelect: (prompt: OAuthSelectPrompt)                  // 必填
+    => Promise<string | undefined>;
+  onProgress?: (message: string) => void;
   signal?: AbortSignal;
 }
 ```
 
-四个回调各有分工：
+> **破坏性变更（v0.75.5）**：`onDeviceCode` 和 `onSelect` 从无到有，且是**必填**的。任何实现 OAuth UI 的宿主（终端、Slack bot、Web UI）都必须提供这两个回调，否则无法通过类型检查。这是 ai 层与产品层之间的契约收紧。
+
+六个回调各有分工：
 
 **`onAuth`** 是"请用户打开这个 URL 去授权"。参数包含 `url` 和可选的 `instructions`。终端实现会打印 URL 并尝试 `open` 命令打开浏览器；Slack bot 实现会发送一条包含链接的消息；Web UI 实现会弹出一个新窗口。OAuth provider 只管把 URL 传过去，不管怎么展示。
 
@@ -111,7 +114,17 @@ export interface OAuthLoginCallbacks {
 
 **`onManualCodeInput`** 是 PKCE 流程特有的降级路径。当 `usesCallbackServer` 为 `true` 时，login 流程同时启动本地 HTTP 服务器等待回调和手动输入。如果本地服务器无法接收回调（比如用户在远程 SSH 上运行 CLI，浏览器在另一台机器上），用户可以手动粘贴浏览器重定向后的 URL。这个回调让两条路径竞赛 — 哪个先拿到授权码就用哪个。
 
-这个设计的关键洞察是：**OAuth 交互的本质是几个固定步骤（展示 URL、获取输入、报告进度），但展示方式因环境而异。** 把步骤和展示分离，一套 OAuth 逻辑就能在所有环境中复用。
+**`onDeviceCode`** 是 device-code 流程的展示入口。参数 `OAuthDeviceCodeInfo` 包含用户码（user code）和验证地址（verification URI）。宿主负责把"请在浏览器打开 X，输入码 Y"展示给用户。GitHub Copilot 一直走这条路；OpenAI Codex 自 v0.77.0 起也支持设备码登录。
+
+**`onSelect`** 让用户在多个选项中做出选择 — 比如同一个 provider 提供多种登录方式（浏览器 vs 设备码），或一个账号下有多个可用订阅。参数 `OAuthSelectPrompt` 给出选项列表，回调返回用户选中的值（或 `undefined` 表示取消）。
+
+这个设计的关键洞察是：**OAuth 交互的本质是几个固定步骤（展示 URL、展示设备码、获取输入、做选择、报告进度），但展示方式因环境而异。** 把步骤和展示分离，一套 OAuth 逻辑就能在所有环境中复用。
+
+### Device-code：与本地回调并列的第三种登录范式
+
+PKCE + 本地回调服务器要求"运行 CLI 的机器能接收浏览器重定向"。在无头环境（容器、CI、纯 SSH 终端）里这个前提不成立。device-code 流程是另一条路：CLI 向 OAuth server 申请一个**设备码 + 用户码**，把用户码和一个验证 URL 展示给用户（`onDeviceCode`），用户在**任意**一台有浏览器的设备上打开 URL、输入用户码完成授权；CLI 端则轮询 token endpoint 直到授权完成。
+
+pi 把这条流程的共享逻辑抽到了 `packages/ai/src/utils/oauth/device-code.ts`（统一的轮询 + 回调元数据，v0.75.4）。GitHub Copilot 依赖它；OpenAI Codex 把它作为浏览器登录之外的无头替代（导出 `loginOpenAICodexDeviceCode` 与对应的 login-method 常量，v0.77.0）。于是 pi 同时拥有三种登录范式：**PKCE + 本地回调**（Anthropic）、**device-code 轮询**（Copilot、Codex 无头）、以及二者的**手动粘贴降级**。它们共享同一组回调，对宿主而言是同一套交互协议。
 
 ## PKCE：为什么 CLI 应用不能有 client secret
 
@@ -266,8 +279,6 @@ async function exchangeAuthorizationCode(
 const BUILT_IN_OAUTH_PROVIDERS: OAuthProviderInterface[] = [
   anthropicOAuthProvider,
   githubCopilotOAuthProvider,
-  geminiCliOAuthProvider,
-  antigravityOAuthProvider,
   openaiCodexOAuthProvider,
 ];
 
@@ -393,7 +404,7 @@ modifyModels(models: Model<Api>[], credentials: OAuthCredentials)
 
 **1. 认证对循环引擎透明**。循环引擎通过 `getApiKey` 回调拿 key，不知道 key 是 API key、OAuth token、还是刷新后的新 token。认证复杂度被封装在 ai 层。
 
-**2. 5 种 OAuth 流程共享一套 UI 交互协议**。`OAuthLoginCallbacks` 让终端、浏览器、Slack bot 都可以实现自己的 OAuth 交互方式，而 OAuth provider 不需要适配。四个回调（`onAuth`、`onPrompt`、`onProgress`、`onManualCodeInput`）覆盖了所有 OAuth 流程变体需要的 UI 交互。
+**2. 3 种 OAuth 流程共享一套 UI 交互协议**。`OAuthLoginCallbacks` 让终端、浏览器、Slack bot 都可以实现自己的 OAuth 交互方式，而 OAuth provider 不需要适配。六个回调（`onAuth`、`onDeviceCode`、`onPrompt`、`onSelect`、`onProgress`、`onManualCodeInput`）覆盖了 PKCE 回调、device-code、手动粘贴、多选等所有流程变体需要的 UI 交互。
 
 **3. Extension 可以添加新的 OAuth provider**。和 API provider 注册表一样的模式。
 
@@ -407,13 +418,14 @@ modifyModels(models: Model<Api>[], credentials: OAuthCredentials)
 
 **3. 凭证存储不在 ai 层**。`getOAuthApiKey` 需要调用者传入 `credentials` 对象。凭证的存储和加载是产品层的事（存文件、存 keychain 等）。ai 层只负责使用凭证，不负责持久化。
 
-**4. PKCE 流程依赖本地端口可用性**。Anthropic OAuth 硬编码了 `127.0.0.1:53692` 作为回调地址。如果该端口被占用，登录流程会失败。虽然手动输入是降级路径，但用户体验会下降。这是 CLI OAuth 的固有限制 — 没有固定域名可以注册为 redirect URI。
+**4. PKCE 流程依赖本地回调端口**。Anthropic OAuth 使用固定端口 `53692`，但回调主机不再写死 — 可通过环境变量 `PI_OAUTH_CALLBACK_HOST` 配置（默认 `127.0.0.1`，见 `anthropic.ts:32`、`openai-codex.ts:51`），以适配容器、端口转发等场景。端口仍然固定，若被占用登录仍会受影响；此时 device-code 与手动粘贴是更稳的降级路径。这是 CLI OAuth 的固有限制 — 没有固定域名可注册为 redirect URI。
 
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。OAuth 模块是 pi-ai 中变化最频繁的部分 —
-> 每次有新 provider 加入或现有 provider 更改认证方式，都需要更新。
-> Antigravity（Google Cloud 统一代理）和 OpenAI Codex（ChatGPT Plus）是近期添加的。
-> `OAuthProviderInterface` 接口自引入以来保持稳定，只增加了 `usesCallbackServer` 和
-> `modifyModels` 两个可选字段。
+> 本章核心分析基于 pi-mono v0.66.0。OAuth 模块是 pi-ai 中变化最频繁的部分。截至 v0.79.7 的主要变化：
+> - **内建 provider 5→3**：v0.71.0 移除 Google Gemini CLI 与 Antigravity，现为 Anthropic、GitHub Copilot、OpenAI Codex。
+> - **`OAuthLoginCallbacks` 破坏性变更**：v0.75.5 新增**必填**的 `onDeviceCode` 与 `onSelect`，从四回调变为六回调。
+> - **device-code 成为一等机制**：v0.75.4 抽出共享 `device-code.ts`；v0.77.0 OpenAI Codex 支持设备码登录。
+> - **回调主机可配置**：v0.68.0 起回调地址可经 `PI_OAUTH_CALLBACK_HOST` 配置（端口仍固定 53692）。
+> `OAuthProviderInterface` 接口本身保持稳定（`usesCallbackServer`、`modifyModels` 仍为可选字段）。

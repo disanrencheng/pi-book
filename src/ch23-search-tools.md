@@ -109,7 +109,12 @@ export interface FindOperations {
 }
 ```
 
-`fd` 是一个 Rust 写的 `find` 替代品，默认尊重 `.gitignore`、速度极快。当 `fd` 可用时，find 工具通过 `ensureTool` 确保它已安装，然后使用 `spawnSync` 调用。这是一个"能力增强"的设计 — 核心功能不依赖外部工具，但安装了外部工具后性能更好。
+`fd` 是一个 Rust 写的 `find` 替代品，默认尊重 `.gitignore`、速度极快。find 工具通过 `ensureTool("fd", true)`（find.ts:214）确保它可用（必要时自动下载），然后用 `spawn` 流式调用。调用参数里有两个值得注意的细节（find.ts:228-246）：
+
+- **`--no-require-git`**：让 fd 即使在非 git 目录也应用**层级 `.gitignore`**，而不是退化为读取某个全局 ignore 文件（后者会泄漏兄弟目录的规则）。
+- **`--full-path`**：fd 的 `--glob` 默认只匹配文件名（basename）。当 LLM 给的 pattern 含路径分隔符（如 `src/**/*.spec.ts`）时，find 工具会加上 `--full-path`，让 glob 匹配完整路径而非仅文件名 —— 这样"按目录结构搜文件"才能正确工作。
+
+这是一个"能力增强"的设计 — 核心功能不依赖外部工具，但用上 fd 后性能与 `.gitignore` 行为都更好。
 
 ## ripgrep 后端
 
@@ -119,6 +124,8 @@ grep 工具的后端是 ripgrep（`rg`）。选择 ripgrep 而非系统 `grep` �
 2. **速度**。ripgrep 使用 Rust 的 regex crate，在大代码库上比 GNU grep 快数倍
 3. **Unicode 安全**。正确处理 UTF-8 文件，不会因为二进制文件内容导致乱码输出
 4. **单行截断**。ripgrep 可以限制匹配行的最大长度，避免一行 minified JS 消耗大量 context
+
+具体调用方式上，grep 不再"同步逐文件读取再匹配"，而是以 `--json` 模式**流式**运行 ripgrep：`spawn(rgPath, ["--json", "--line-number", "--color=never", "--hidden", ...])`（grep.ts:215-221），然后逐行 `JSON.parse` ripgrep 输出的结构化事件、边流边收集匹配（grep.ts:270-276）。流式 + 子进程的好处是整个搜索**全程可取消**（`AbortSignal` 一到就 kill 子进程）且不阻塞事件循环 —— 这对在大仓库里跑搜索、又随时可能被用户打断的 agent 很关键。
 
 ```typescript
 // packages/coding-agent/src/core/tools/truncate.ts:13
@@ -189,6 +196,7 @@ find 结果在 TUI 中按文件路径显示，每条结果一行，超过 10 条
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。find 和 grep 是较晚从 bash 中分离出来的工具。
-> 它们的 `Operations` 接口（和 edit、bash 一样的 pluggable 设计）允许远程执行。
-> `GREP_MAX_LINE_LENGTH` 的 500 字符限制是在实际使用中根据 minified 文件的噪声问题调整的。
+> 本章核心分析基于 pi-mono v0.66.0，已校订至 v0.79.7。find 和 grep 是较晚从 bash 中分离出来的工具，`Operations` pluggable 设计与三层截断保护保持不变。
+> 主要实现级演进：grep 改为以 ripgrep `--json` **流式**运行（全程可取消、不阻塞，取代同步逐文件读取）；find 用 fd 并加 `--no-require-git`（层级 .gitignore）与 `--full-path`（路径型 glob，如 `src/**/*.spec.ts`）；
+> 另外 grep/find 对以 `-` 开头的 flag-like pattern 用 `--` 分隔做了注入修复（v0.71.0）。
+> `GREP_MAX_LINE_LENGTH` 的 500 字符限制根据 minified 文件噪声问题调整。
