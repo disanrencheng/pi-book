@@ -85,11 +85,16 @@ interface Settings {
   doubleEscapeAction?: "fork" | "tree" | "none";
   treeFilterMode?: "default" | "no-tools" | "user-only" | "labeled-only" | "all";
 
+  // 安全：项目信任（仅全局有效）
+  defaultProjectTrust?: "ask" | "always" | "never";  // default: "ask"
+
   // 杂项
   lastChangelogVersion?: string;
   quietStartup?: boolean;
   collapseChangelog?: boolean;
   sessionDir?: string;
+  httpProxy?: string;
+  httpIdleTimeoutMs?: number;
 }
 ```
 
@@ -112,8 +117,14 @@ interface BranchSummarySettings {
 interface RetrySettings {
   enabled?: boolean;     // default: true
   maxRetries?: number;   // default: 3
-  baseDelayMs?: number;  // default: 2000（指数退避：2s, 4s, 8s）
-  maxDelayMs?: number;   // default: 60000
+  baseDelayMs?: number;  // default: 2000（pi 应用层指数退避：2s, 4s, 8s）
+  provider?: ProviderRetrySettings;  // v0.70.1 新增，透传给 SDK/provider
+}
+
+interface ProviderRetrySettings {  // settings-manager.ts:21-25
+  timeoutMs?: number;       // SDK/provider 单次请求超时
+  maxRetries?: number;      // provider 层重试次数
+  maxRetryDelayMs?: number; // default: 60000，服务端要求的最大退避，超过即失败
 }
 
 interface TerminalSettings {
@@ -155,6 +166,8 @@ interface MarkdownSettings {
 **UI 层**：`markdown`、`editorPaddingX`、`autocompleteMaxVisible`、`showHardwareCursor`、`doubleEscapeAction`、`treeFilterMode` — 纯粹的用户体验偏好，通常只在全局设置。
 
 每一层的默认值都经过精心选择。比如 `retry.baseDelayMs = 2000` 配合指数退避产生 2s → 4s → 8s 的重试间隔 — 既不会因为太频繁而被 API 限流，也不会因为等太久而影响用户体验。`compaction.keepRecentTokens = 20000` 大约相当于 10-15 轮对话，足以保留足够的近期上下文。
+
+> **重试配置分两层（v0.70.1）**：注意 `retry` 现在拆成了两层语义。顶层的 `enabled` / `maxRetries` / `baseDelayMs` 是 **pi 应用层**的退避策略（pi 自己在两次 stream 调用之间等多久再重试）；而 `retry.provider`（`ProviderRetrySettings`）是**透传给底层 SDK/provider** 的参数 —— `timeoutMs`（单次请求超时）、`maxRetries`（provider 自己的重试次数）、`maxRetryDelayMs`（服务端通过 `Retry-After` 要求的最大退避，超过即放弃）。早期版本只有一个扁平的 `retry.maxDelayMs`，它在迁移时被自动搬到 `retry.provider.maxRetryDelayMs`（见 `migrateSettings`，settings-manager.ts:409-430）。把"应用层何时重试"和"provider 层如何重试"分开，是因为这两者解决的是不同层面的失败。
 
 ## Settings 的加载与合并
 
@@ -354,7 +367,7 @@ function loadContextFileFromDir(dir: string) {
 5. /project/packages/legacy/AGENTS.md  ← 当前工作目录
 ```
 
-三者**同时生效**，后者可以补充或细化前者的规则。这些文件最终被注入到 system prompt 的 `# Project Context` 区域（见第 14 章）。
+三者**同时生效**，后者可以补充或细化前者的规则。这些文件最终被注入到 system prompt 的 `<project_context>` 区域（v0.75.0 起用 XML 标签包裹，见第 14 章）。
 
 ### SYSTEM.md 的替换规则
 
@@ -431,7 +444,6 @@ getRetrySettings() {
     enabled: this.getRetryEnabled(),
     maxRetries: this.settings.retry?.maxRetries ?? 3,
     baseDelayMs: this.settings.retry?.baseDelayMs ?? 2000,
-    maxDelayMs: this.settings.retry?.maxDelayMs ?? 60000,
   };
 }
 ```
@@ -473,6 +485,63 @@ async reload(): Promise<void> {
 
 `reload` 先等待写入队列完成（防止读到半写的状态），然后重新从存储加载两级配置。这是一个"热重载"机制 — 用户不需要重启 pi 就能看到配置变更的效果。
 
+## 编辑哪一层：`pi config -l` 与作用域切换
+
+前面讲的都是配置**如何合并**，但还有一个操作性的问题：当用户想改一个设置，他改的是全局那份还是项目那份？这两份文件路径不同（`~/.pi/agent/settings.json` vs `{cwd}/.pi/settings.json`），语义也不同 —— 全局是"我的个人偏好"，项目是"这个仓库的约定，会提交进 git"。
+
+pi 用一个显式的作用域概念把这件事摆到台面上。命令行入口是 `pi config`：
+
+```
+// package-manager-cli.ts:92,99-103
+pi config [-l] [--approve|--no-approve]
+
+不带 -l：编辑全局设置（~/.pi/agent/settings.json）
+-l, --local：编辑项目覆盖（.pi/settings.json）
+```
+
+`config`（含 `install`/`remove` 等包管理子命令）默认落在**全局**，加 `-l` / `--local` 才写**项目本地**那一层（v0.80.4）。交互式配置编辑器里则用 **Tab 键在"全局 / 项目"两个作用域之间切换** —— 同一个设置项，用户可以清楚地看到、并选择自己在往哪一层写。这解决了三级覆盖的一个隐蔽痛点：如果不告诉用户"你现在改的是哪一层"，他很容易把本该是项目约定的设置写进了全局、或反之。
+
+这一层"项目本地资源"和第 17 章 Resource Loader 的项目本地资源覆盖是同一个作用域概念的两面 —— 一个管 `settings.json` 的分层，一个管 extensions/skills/prompts 的分层，都受同一道 Project Trust 闸门（下节）管辖。
+
+顺带一提本区间新增的几个 settings（都遵循前述 optional + getter 默认值的模式）：`externalEditor`（`Ctrl+G` 外部编辑器命令，优先于 `VISUAL`/`EDITOR`，`settings-manager.ts:97`）、`outputPad`（聊天输出的水平留白，`0 | 1`，`:120`）、`showCacheMissNotices`（在 transcript 里提示明显的 prompt-cache miss，`:96`），以及 `shellPath` 现在支持**开头 `~` 展开**（`:98`/`:880`，Cygwin 等场景更省事）。
+
+## 第四道闸门：Project Trust
+
+到这里为止，本章一直把"项目级配置覆盖全局"当作无条件的事实 —— 进入一个目录，它的 `.pi/settings.json`、`AGENTS.md`、甚至 `packages`/`extensions`/`skills` 就自动加载并生效。但从 **v0.79.0** 起，这个假设不再成立。
+
+问题出在威胁模型上。前三级覆盖里，项目级配置是**可执行的攻击面**：一个 `.pi/settings.json` 可以通过 `packages` 字段让 pi 从 npm/git 拉取并加载任意代码，`extensions` 可以注入运行时钩子，`AGENTS.md` 能往 system prompt 里塞入任意指令。这意味着——**仅仅 `cd` 进一个 clone 下来的陌生仓库并启动 pi，就可能执行该仓库作者预置的代码**。三级覆盖越方便，这个口子就越危险。
+
+pi 的解法是在"项目本地资源加载"之前插入一道**信任闸门**：
+
+```mermaid
+flowchart TD
+    Start["进入项目 / 启动会话"] --> Global["加载全局资源<br/>~/.pi/agent/（始终信任）"]
+    Global --> Check{"项目已受信任?<br/>查 trust.json"}
+    Check -->|是| Load["加载项目本地<br/>settings / AGENTS.md / packages / extensions / skills"]
+    Check -->|否| Decide{"defaultProjectTrust<br/>或 --approve"}
+    Decide -->|always / --approve| Load
+    Decide -->|never| Skip["跳过项目本地资源<br/>仅用全局配置运行"]
+    Decide -->|ask（默认，交互）| Prompt["弹出 /trust 选择<br/>记入 trust.json"]
+    Prompt --> Load
+    Prompt --> Skip
+```
+
+闸门的关键约定：
+
+**1. 全局资源始终信任，项目资源需要决策**。`~/.pi/agent/` 下的配置是用户自己的，无条件加载。只有**项目本地**那一层（`{cwd}/.pi/`）受闸门管辖。这与三级覆盖的优先级是正交的两个维度：优先级回答"谁覆盖谁"，信任回答"项目这一级到底加不加载"。
+
+**2. 决策结果持久化在全局**。一旦用户对某个项目作出信任决定，它被写入 `~/.pi/agent/trust.json`（`trust-manager.ts:212`，路径基于 `agentDir`，因此也遵循下文的 `CONFIG_DIR_NAME`）。下次进入同一项目不再询问。注意它存在**全局**而非项目内 —— 否则攻击者只要在自己仓库里预置一个"已信任"标记就能绕过闸门。
+
+**3. 三种默认策略 + 一个一次性开关**。全局设置 `defaultProjectTrust` 取 `"ask" | "always" | "never"`（默认 `"ask"`，且**仅全局有效**，`settings-manager.ts:61,95`）：`ask` 在交互模式下弹出 `/trust` 选择器询问；`always` 自动信任所有项目；`never` 一律跳过项目本地资源。命令行上 `--approve` / `-a` 是一次性开关 —— "本次运行信任项目本地文件"（`args.ts:180`），用于自动化/CI 等非交互场景显式授权。会话内还能用 `/trust` 命令随时改变当前项目的信任状态。
+
+**4. extension 可介入信任决策**。闸门会触发 `project_trust` 扩展事件（`types.ts:504`），extension 也能通过 `ctx.isProjectTrusted()`（`types.ts:318`）查询当前项目是否受信任 —— 例如一个企业策略 extension 可以据此决定是否放行。
+
+判定"这个项目是否含有需要信任才能加载的本地资源"由 `hasTrustRequiringProjectResources(cwd)` 完成（`interactive-mode.ts:3281`）：如果项目根本没有 `.pi/` 本地资源，就没有可执行攻击面，闸门直接放行、不打扰用户。
+
+这道闸门改变了第 17 章 Resource Loader 的加载流程 —— 项目本地资源的 `reload` 现在夹在"全局先加载、项目后加载"之间多了一步信任检查（详见第 17 章）。它也是 pi 在"开箱即用的便利"与"陌生仓库的安全"之间做出的明确取舍：默认 `ask` 让便利与安全都不极端。
+
+> **`CONFIG_DIR_NAME` 作为 rebrand 扩展点（v0.70.0）**：本章多处出现的 `.pi` 目录名其实并非硬编码常量，而是从 `config.ts` 导出的 `CONFIG_DIR_NAME`（v0.79.7 起公开导出）。`SYSTEM.md` 发现（`resource-loader.ts`）、`trust.json` 路径、CLI 帮助文本里的示例路径都引用它。这让基于 pi 二次封装、换皮（rebrand）成自有产品的下游能统一改掉配置目录名，而不必到处替换字符串。
+
 ## 取舍分析
 
 ### 得到了什么
@@ -493,11 +562,14 @@ async reload(): Promise<void> {
 
 **3. 没有"dry run"或"explain"命令**。用户不能简单地查看"当前生效的完整配置是什么"。需要自己推理合并后的结果。
 
+**4. 信任闸门引入了额外的摩擦**。Project Trust（v0.79.0）虽然堵上了"进入陌生仓库即执行预置代码"的口子，但代价是首次进入一个带本地资源的项目时多了一次询问。`defaultProjectTrust` 的三种取值本质上是在"安全"与"零打扰"之间让用户自己选位置。
+
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。三级配置系统自引入以来结构稳定。
-> Settings 的可配置项随产品功能增加而不断扩展（如 compaction、retry、image、thinkingBudgets、markdown 设置）。
-> `AGENTS.md` 和 `CLAUDE.md` 作为上下文文件同时被支持。
-> PackageSource 的对象格式（带 skills/extensions 过滤）是后来添加的增强。
-> Settings 迁移机制（`migrateSettings`）确保旧配置文件在升级后自动兼容。
+> 本章核心分析基于 pi-mono v0.66.0，已对照 **v0.82.1**。三级覆盖的核心结构自引入以来稳定，但有几处设计级增补：
+> ① **配置作用域切换**（v0.80.4）：`pi config -l` 编辑项目本地那层、交互编辑器用 Tab 切换全局/项目作用域；与第 17 章项目本地资源覆盖同属一个作用域概念。
+> ② **Project Trust 信任闸门**（v0.79.0）：项目本地 settings/resources/extensions/packages/skills 的加载受 `defaultProjectTrust`（ask/always/never）、`--approve`、`/trust` 与 `~/.pi/agent/trust.json` 管辖，不再无条件加载。
+> ③ **重试配置分层**（v0.70.1）：`retry` 拆为应用层退避与 `retry.provider.*`（透传 SDK），旧 `retry.maxDelayMs` 自动迁移到 `retry.provider.maxRetryDelayMs`。
+> ④ 新增 settings：`externalEditor`、`outputPad`、`showCacheMissNotices`，`shellPath` 支持开头 `~` 展开（v0.80.3/v0.80.4/v0.80.6）；此外 httpProxy、httpIdleTimeoutMs、自动 light/dark 主题等持续扩展，`.pi` 目录名由 `CONFIG_DIR_NAME` 提供以支持 rebrand。
+> `AGENTS.md`/`CLAUDE.md` 双支持、PackageSource 对象格式、`migrateSettings` 自动迁移均保持不变。

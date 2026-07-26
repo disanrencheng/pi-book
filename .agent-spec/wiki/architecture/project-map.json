@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "projects": [
+    {
+      "id": "pi-book",
+      "title": "pi-book",
+      "repo": "ZhangHanDong/pi-book",
+      "role": "本仓库:《pi 的设计艺术》mdBook 书稿与其 agent-spec 合约",
+      "interfaces": [
+        "mdbook"
+      ],
+      "protocols": [
+        "markdown"
+      ],
+      "status": "active",
+      "source_files": [
+        "src/SUMMARY.md",
+        "CLAUDE.md"
+      ],
+      "external_sources": [
+        "https://github.com/ZhangHanDong/pi-book"
+      ],
+      "path": "projects/pi-book.md"
+    },
+    {
+      "id": "pi-mono",
+      "title": "pi-mono",
+      "repo": "earendil-works/pi",
+      "role": "本书的分析对象:pi coding agent 的 TypeScript monorepo",
+      "interfaces": [
+        "npm",
+        "cli"
+      ],
+      "protocols": [
+        "stdio",
+        "jsonl"
+      ],
+      "status": "active",
+      "source_files": [
+        "CLAUDE.md",
+        "src/ch02-packages.md"
+      ],
+      "external_sources": [
+        "https://github.com/earendil-works/pi"
+      ],
+      "path": "projects/pi-mono.md"
+    }
+  ],
+  "flows": [
+    {
+      "id": "pi-book-tracks-pi-mono",
+      "title": "pi-book 对 pi-mono 的版本同步流",
+      "projects": [
+        "pi-book",
+        "pi-mono"
+      ],
+      "kind": "documents",
+      "protocols": [
+        "git",
+        "markdown"
+      ],
+      "requirements": [
+        "REQ-SYNC"
+      ],
+      "specs": [
+        "specs/update-v082-structural.spec.md",
+        "specs/update-v082-ai.spec.md",
+        "specs/update-v082-runtime.spec.md",
+        "specs/update-v082-coding-agent.spec.md",
+        "specs/update-v082-tui.spec.md"
+      ],
+      "source_files": [
+        "CLAUDE.md",
+        "src/SUMMARY.md",
+        "knowledge/requirements/req-sync.md"
+      ],
+      "external_sources": [
+        "https://github.com/earendil-works/pi"
+      ],
+      "path": "flows/pi-book-tracks-pi-mono.md"
+    }
+  ],
+  "edges": [
+    {
+      "from": "pi-book",
+      "to": "pi-mono",
+      "kind": "documents",
+      "flow_id": "pi-book-tracks-pi-mono",
+      "protocols": [
+        "git",
+        "markdown"
+      ]
+    }
+  ],
+  "diagnostics": []
+}

@@ -9,10 +9,14 @@
 上一章展示了 `runLoop()` 如何在内层循环中调用 `executeToolCalls()`。那个调用看起来只是一行代码：
 
 ```typescript
-const toolResults = await executeToolCalls(
+const batch = await executeToolCalls(
   currentContext, message, config, signal, emit
 );
+// batch.messages: ToolResultMessage[]（按 LLM 源顺序排列）
+// batch.terminate: 整批是否请求 agent 停止（见第 8 章）
 ```
+
+（v0.69.0 起 `executeToolCalls` 的返回类型从裸 `ToolResultMessage[]` 变成 `{ messages, terminate }`，`terminate` 喂给上一章的内层续轮判断。）
 
 但如果展开 `executeToolCalls()`，你会发现它并不是简单地"找到工具，传参数，拿结果"。它是一条精心设计的三阶段管道：**prepare → execute → finalize**。
 
@@ -226,6 +230,7 @@ async function finalizeExecutedToolCall(
 - 返回 `undefined` → 不修改任何东西
 - 返回 `{ content: [...] }` → 只替换 content，保留原来的 details 和 isError
 - 返回 `{ isError: false }` → 只把错误标记改为成功，保留原来的 content 和 details
+- 返回 `{ terminate: true }` → 只覆盖"提前停止"提示（`types.ts:80`），不动其他字段；配合第 8 章的整批 terminate 判断，让钩子也能在工具结算后请求 agent 停下
 
 这种"字段级覆盖"设计让钩子可以做非常精确的修改：
 
@@ -234,20 +239,51 @@ async function finalizeExecutedToolCall(
 - **错误降级**：某些工具的"错误"其实是预期的（比如 grep 没找到匹配），改 isError 为 false
 - **结果增强**：在 details 中注入额外元数据供 UI 展示
 
+**工具结果还能动态引入新工具**。除了 content / details / terminate，`AgentToolResult` 上还有一个字段 `addedToolNames?: string[]`（`types.ts:363`）：一个工具在返回结果时，可以声明"从这条转录点起，这些新工具变得可用"。finalize 阶段把它原样传播到最终写入上下文的 `ToolResultMessage` 上（`agent-loop.ts:783`，仅在非空时带上该字段）：
+
+```typescript
+// packages/agent/src/agent-loop.ts:773-786（简化）
+function createToolResultMessage(finalized): ToolResultMessage {
+  return {
+    role: "toolResult",
+    toolCallId: finalized.toolCall.id,
+    toolName: finalized.toolCall.name,
+    content: finalized.result.content ?? [],
+    details: finalized.result.details,
+    ...(finalized.result.addedToolNames?.length
+      ? { addedToolNames: finalized.result.addedToolNames }   // ← 传播
+      : {}),
+    isError: finalized.isError,
+    timestamp: Date.now(),
+  };
+}
+```
+
+这就打通了一条**消息锚定的工具加载**（message-anchored tool loading，v0.80.7）通道：某个工具的执行结果本身可以"解锁"一批后续工具，而且解锁点被钉在具体的转录位置上 —— 从这条 `ToolResultMessage` 往后的 turn 才看得到这些新工具，转录回放时也能在同一个锚点复现同样的可用工具集。典型场景是一个"进入某子系统 / 加载某 skill"的工具，执行后才把该子系统专属的工具暴露给模型，而不必一开始就把全部工具塞进 context。注意 pi 在这里只负责**传播这个字段**；真正据此把工具加进 active 集合是上层（工具来源管理方）的职责。
+
 ## Parallel vs Sequential：两种执行策略
 
 当 LLM 一次返回多个工具调用时，pi 提供了两种执行策略：
 
 ```typescript
-// packages/agent/src/agent-loop.ts:336-348
+// packages/agent/src/agent-loop.ts:373-388
 
 async function executeToolCalls(...) {
-  if (config.toolExecution === "sequential") {
+  // 批次中任一工具自带 executionMode: "sequential"，整批就降级串行
+  const hasSequentialToolCall = toolCalls.some(
+    (tc) => currentContext.tools
+      ?.find((t) => t.name === tc.name)?.executionMode === "sequential",
+  );
+  if (config.toolExecution === "sequential" || hasSequentialToolCall) {
     return executeToolCallsSequential(...);
   }
   return executeToolCallsParallel(...);  // 默认
 }
 ```
+
+注意执行策略**不再只由 `config.toolExecution` 这一个全局开关决定**。`AgentTool` 新增了一个 per-tool 的 `executionMode` 字段（`types.ts:388`）：单个工具可以声明自己"必须串行"。分流规则是 `config.toolExecution === "sequential"` **或**批次中任一工具的 `executionMode === "sequential"` → 整批走串行。
+
+这个"混批含一个 sequential 工具就整批降级串行"的规则很关键：它让一个有副作用、不能与他人并发的工具（比如一个会改全局状态的工具）有办法**强制**整批串行，而不必要求产品层把全局执行模式也切成 sequential。代价是粒度较粗 —— 一个 sequential 工具会拖慢同批的其他本可并行的工具。
 
 两种策略的差异不只是"串行 vs 并行"那么简单。让我们对比它们的执行时序：
 
@@ -269,68 +305,64 @@ sequenceDiagram
     F-->>Loop: result_2
 
     Note over Loop: === Parallel 模式 ===
-    Loop->>P: prepare(tool_1)
-    P-->>Loop: prepared_1
-    Loop->>P: prepare(tool_2)
-    P-->>Loop: prepared_2
-    Loop->>E: execute(prepared_1) 同时
-    Loop->>E: execute(prepared_2) 同时
-    E-->>F: executed_1
-    F-->>Loop: result_1
-    E-->>F: executed_2
-    F-->>Loop: result_2
+    Loop->>P: prepare(tool_1) 串行
+    Loop->>P: prepare(tool_2) 串行
+    Loop->>E: 并发启动 execute(tool_1)/execute(tool_2)
+    E-->>F: tool_2 先完成 → finalize
+    F-->>Loop: emit tool_execution_end(2)（完成顺序）
+    E-->>F: tool_1 后完成 → finalize
+    F-->>Loop: emit tool_execution_end(1)（完成顺序）
+    Note over Loop: 再按源顺序拼装 tool-result 工件 [1, 2]
 ```
 
 **Sequential 模式**：每个工具调用独立完成整条管道（prepare → execute → finalize），然后才开始下一个。简单、可预测、但慢。
 
 **Parallel 模式**的设计更微妙。它**不是**完全并行的：
 
-1. **Prepare 阶段串行**。所有工具调用按顺序通过 prepare，包括参数验证和 `beforeToolCall` 钩子（这些字段都定义在第 8 章介绍的 `AgentLoopConfig` 中）。串行 prepare 保证了钩子调用的**确定性顺序** — 钩子可以基于"第几个工具调用"做决策（比如"同一个 turn 中最多允许 3 次文件写操作"），而不需要担心并发导致的非确定性。
-2. **Execute 阶段并行**。所有通过 prepare 的工具调用同时开始执行。
-3. **Finalize 阶段按源顺序**。结果按 LLM 返回的工具调用顺序（不是执行完成顺序）进行 finalize 和事件发射。
+1. **Prepare 阶段串行**。所有工具调用按源顺序通过 prepare，包括参数验证和 `beforeToolCall` 钩子（这些字段都定义在第 8 章介绍的 `AgentLoopConfig` 中），`tool_execution_start` 也在这一遍按源顺序发射。串行 prepare 保证了钩子调用的**确定性顺序** — 钩子可以基于"第几个工具调用"做决策（比如"同一个 turn 中最多允许 3 次文件写操作"），而不需要担心并发导致的非确定性。
+2. **Execute + Finalize 阶段并行**。所有通过 prepare 的工具调用并发跑完 execute → finalize（含 `afterToolCall`），**每个工具一完成就立即发射自己的 `tool_execution_end`** —— 这一串生命周期事件因此按**完成顺序**到达订阅者，而不是源顺序。
+3. **持久化的 tool-result 工件按源顺序**。所有工具结算完后，循环再按 LLM 返回的源顺序重新拼装 `ToolResultMessage[]`（并按源顺序发射 tool-result 消息事件），保证写进上下文的工具结果顺序是确定的。
 
-来看代码中 parallel 模式的关键段落：
+这里有一个**容易被旧版文档误导的细节**：早期实现里 finalize 是一个 `for...await` 串行循环，`afterToolCall` 确实严格按源顺序运行。v0.68.1 起改为并发结算（下方代码的 `Promise.all`），生命周期事件与持久化工件的顺序**被拆成了两套**：
 
 ```typescript
-// packages/agent/src/agent-loop.ts:390-438（简化）
+// packages/agent/src/agent-loop.ts:451-517（简化）
 
 async function executeToolCallsParallel(...) {
-  const results: ToolResultMessage[] = [];
-  const runnableCalls: PreparedToolCall[] = [];
+  const finalizedCalls: FinalizedToolCallEntry[] = [];
 
-  // 串行 prepare
+  // 串行 prepare：按源顺序发 tool_execution_start
   for (const toolCall of toolCalls) {
+    await emit({ type: "tool_execution_start", ... });
     const preparation = await prepareToolCall(...);
     if (preparation.kind === "immediate") {
-      results.push(await emitToolCallOutcome(...));
+      await emitToolExecutionEnd(finalized, emit);   // 立即结算
+      finalizedCalls.push(finalized);
     } else {
-      runnableCalls.push(preparation);
+      // 推入一个 thunk：execute → finalize → 发 tool_execution_end
+      finalizedCalls.push(async () => { ... });
     }
   }
 
-  // 并行 execute（同时启动所有）
-  const runningCalls = runnableCalls.map((prepared) => ({
-    prepared,
-    execution: executePreparedToolCall(prepared, signal, emit),
-  }));
+  // 并发跑完所有 thunk —— tool_execution_end 按【完成顺序】发射
+  const ordered = await Promise.all(
+    finalizedCalls.map((e) => typeof e === "function" ? e() : e)
+  );
 
-  // 按源顺序 finalize
-  for (const running of runningCalls) {
-    const executed = await running.execution;
-    results.push(
-      await finalizeExecutedToolCall(..., running.prepared, executed, ...)
-    );
+  // 再按【源顺序】拼装并发射 tool-result 消息工件
+  const messages: ToolResultMessage[] = [];
+  for (const finalized of ordered) {
+    const msg = createToolResultMessage(finalized);
+    await emitToolResultMessage(msg, emit);
+    messages.push(msg);
   }
-
-  return results;
+  return { messages, terminate: shouldTerminateToolBatch(ordered) };
 }
 ```
 
-注意第二步的 `runnableCalls.map(...)` — 它在创建 `runningCalls` 数组时就调用了 `executePreparedToolCall()`。这意味着所有 execute 调用在 `map` 完成时就已经开始了（Promise 被创建了）。然后第三步的 `for` 循环按顺序 `await` 每个 Promise — 如果第二个工具比第一个先完成，它的结果会等到第一个 finalize 完之后才被处理。
+**为什么要把"事件"和"工件"拆成两套顺序？**
 
-**为什么 finalize 要按源顺序？**
-
-因为 `afterToolCall` 钩子需要访问 `context`（包括之前的工具结果）。如果 finalize 按完成顺序处理，钩子看到的 context 就是非确定性的 — 同样的输入在不同运行中可能看到不同的 context 状态。按源顺序 finalize 保证了确定性。
+因为它们服务两种不同的消费者。**生命周期事件**（`tool_execution_end`）服务 UI —— 哪个工具先跑完，就先把它的结果渲染出来，用户能尽早看到进展，没必要为了排版让先完成的工具干等。**持久化工件**（`ToolResultMessage[]`）服务的是上下文与回放 —— 写进 `AgentContext`、最终喂给 LLM 的工具结果必须有确定顺序（与源顺序一致），否则同样的输入会产生不同的转录，破坏可重放性。一句话：**对人眼用完成顺序，对模型和存储用源顺序。**
 
 ## 取舍分析
 
@@ -360,22 +392,29 @@ async function executeToolCallsParallel(...) {
 3. 循环 emit `tool_execution_start` for `edit`
 4. `edit` 通过 prepare：工具存在 → TypeBox 验证 edits 数组格式 → `beforeToolCall` 检查不在禁止列表 → 返回 `kind: "prepared"`
 
-**Execute 阶段**（并行）：
-5. `read.execute()` 和 `edit.execute()` 同时启动
-6. `read` 先完成（只是读磁盘），但它的结果**等待**被 finalize
-7. `edit` 后完成（要写磁盘），它的结果也等待被 finalize
+**Execute + Finalize 阶段**（并发，事件按完成顺序）：
+5. `read` 和 `edit` 的 execute → finalize 并发跑
+6. `read` 先完成（只是读磁盘）→ 立即 finalize（`afterToolCall` 脱敏文件内容）→ 先发 `tool_execution_end(read)`
+7. `edit` 后完成（要写磁盘）→ finalize（`afterToolCall` 记录审计日志）→ 后发 `tool_execution_end(edit)`
+8. UI 因此先看到 read 的结果、后看到 edit 的结果 —— 按**完成顺序**
 
-**Finalize 阶段**（按源顺序）：
-8. 先 finalize `read` 的结果 — `afterToolCall` 可以脱敏文件内容
-9. 再 finalize `edit` 的结果 — `afterToolCall` 可以记录审计日志
+**拼装 tool-result 工件**（按源顺序）：
+9. 两者都结算后，循环按源顺序 `[read, edit]` 重新拼装 `ToolResultMessage[]` 并发射 tool-result 消息事件 —— 写进上下文、最终喂给 LLM 的顺序与 LLM 调用顺序一致
 
-注意一个微妙之处：如果两个工具调用中，`read` 的 prepare 失败了（比如 `beforeToolCall` 阻止了它），它的错误结果会在 prepare 循环中**立即**被加入 `results` 数组。然后 `edit` 继续 prepare 和 execute。最终 `results` 数组的顺序是：`read`（prepare 阶段的 immediate 结果）→ `edit`（execute + finalize 的结果）。
+注意一个微妙之处：如果两个工具调用中，`read` 的 prepare 失败了（比如 `beforeToolCall` 阻止了它），它会在串行 prepare 循环中**立即**结算（emit `tool_execution_end`）并作为一个 immediate 项留在源位置。等所有 thunk 并发跑完，最终拼装的工件顺序仍是源顺序：`read` → `edit`。
 
 这个设计的核心判断是：**工具执行不是一个独立的子系统，而是循环的有机组成部分。** 三阶段管道让循环引擎在不增加核心复杂度的前提下，为上层提供了精确的控制点。
 
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。三阶段管道自引入以来结构稳定。
-> `parallel` 执行模式在较早版本中作为默认策略引入，取代了最初的纯 `sequential` 模式。
-> `prepareArguments` 钩子是后来为支持 edit 工具 API 演进而添加的。
+> 本章核心分析基于 pi-mono v0.66.0，并已对照 v0.82.1。三阶段管道结构稳定。
+> `parallel` 执行模式作为默认策略引入，取代了最初的纯 `sequential` 模式；
+> v0.79 起 `AgentTool` 新增 per-tool `executionMode`，批次中任一工具声明 `"sequential"`
+> 即令整批降级串行。v0.68.1 起 parallel 模式的 execute+finalize 改为并发结算：
+> 生命周期事件 `tool_execution_end` 按**完成顺序**发射，而持久化的 tool-result 工件仍按
+> **源顺序**拼装（旧版"finalize 严格按源顺序"的描述已不适用）。v0.69.0 起
+> `executeToolCalls` 返回 `{ messages, terminate }`，工具可通过整批 `terminate` 提示请求
+> agent 停止。`prepareArguments` 钩子为支持 edit 工具 API 演进而添加。v0.80.7 起
+> `AgentToolResult.addedToolNames` 会传播到 `ToolResultMessage`（`agent-loop.ts:783`），
+> 支持消息锚定的动态工具引入：工具结果可从该转录点起解锁一批后续工具。

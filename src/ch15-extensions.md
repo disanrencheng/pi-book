@@ -41,11 +41,13 @@ export interface ExtensionAPI {
      handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): void;
   on(event: "input",
      handler: ExtensionHandler<InputEvent, InputEventResult>): void;
-  // ... 共 26 种事件
+  // ... 二十多种事件，且随版本持续增加
 }
 ```
 
 事件系统的设计有两层含义。**观察型事件**（如 `session_start`、`agent_end`、`message_update`）让 extension 被动获知系统状态变化。**干预型事件**（如 `tool_call`、`input`、`context`）通过返回值影响系统行为 — `tool_call` 可以 block 工具执行，`input` 可以 transform 用户输入，`context` 可以修改发送给 LLM 的消息列表。
+
+> **事件面持续扩张**：早期版本约有 26 种事件，现已增至二十多种并仍在增长，因此本书不再钉死具体数字。值得注意的是几个较新的 hook：`after_provider_response`（v0.67.6，能拿到 provider 返回的 HTTP 状态码与响应头，types.ts:687）、`message_end`（其返回值 `MessageEndEventResult` 可以替换一条刚 finalize 的消息，types.ts:751）、配合第 13 章信任闸门的 `project_trust`（types.ts:514）。本区间又新增了三个：`before_provider_headers`（types.ts:681，在请求发出前改写 provider 的 HTTP 头 —— 干预型）、`agent_settled`（types.ts:718，agent 彻底停下、队列排空后触发 —— 适合做"一切就绪再收尾"的动作）、`session_info_changed`（types.ts:566，会话元信息如显示名变化时触发 —— 观察型）。它们大多属于"通过返回值改变系统行为"或"在精确生命周期点收尾"这两类，而非单纯观察。
 
 这个区分体现在 handler 的泛型签名中：
 
@@ -93,6 +95,12 @@ export interface ToolDefinition<TParams extends TSchema = TSchema,
 
 注意 `promptSnippet` 和 `promptGuidelines` — 工具不仅有 schema 描述，还能直接向 system prompt 注入使用指南。这让工具的"说明书"和"实现"在同一个定义中完成。
 
+> **参数 schema 用 `typebox`（v0.69.0）**：`parameters` 字段是一个 TypeBox schema，`Static<TParams>` 把它映射回静态 TS 类型。这里有一个容易被忽略的迁移：extension 现在应从 **`typebox`** 导入 `Type` / `Static` / `TSchema`（核心代码即 `import type { Static, TSchema } from "typebox"`，types.ts:42），而不再是旧的 `@sinclair/typebox`（0.34）。换到 `typebox` 1.x 的动机是它自带校验与转换、不依赖 `eval`，因而在禁用 `eval` 的运行时（如 Cloudflare Workers）也能真正执行工具参数校验，而不是静默跳过。旧的 `@sinclair/typebox` 仍作为向后兼容别名保留（见下文 VIRTUAL_MODULES）。
+
+> **工具选择是"名字白名单"（v0.68.0）**：extension 用 `registerTool` 注册的工具，会和内建工具汇入同一个工具集。而宿主（SDK 调用方或 CLI）**选择启用哪些工具**的方式，在 v0.68.0 改成了**字符串名字白名单** —— `createAgentSession({ tools: ["read", "bash", "my_tool"] })`（`tools?: string[]`，sdk.ts:67）。早期那种导出预构建工具对象（`readTool` / `codingTools`）的方式被移除，改为按需用工厂构造（`createReadTool(cwd)` 等，需要显式传入 cwd）。白名单里写内建工具名就启用内建工具，写 extension 注册的工具名就启用该 extension 工具 —— 内建与扩展工具在选择层面一视同仁。工具激活模型的完整设计见第 19 章。
+
+> **cache-friendly 动态工具加载（v0.80.7）**：extension 不一定在启动时就把工具全注册好 —— 它可以在**运行中**（比如某个 tool result 到达后）再激活新工具。问题是：工具定义是 system prompt 的一部分，中途加工具会改变发给模型的前缀，进而**打掉 prompt cache**。v0.80.7 让受支持的 Anthropic 与 OpenAI Responses 模型能在"工具变得可用的位置"加载定义，而**保留已缓存的 prompt 前缀**不失效（配合 Kimi 的 native deferred tool loading）。这批新工具名如何随 `addedToolNames` 在循环里被解析并传播，见第 9 章。这与第 14 章"移除当前日期以稳定 prompt cache"是同一条纪律的两面 —— 凡是会动到 prompt 前缀的改动，都要盘算它对缓存的代价。
+
 ### 能力 3：命令与快捷键 — 用户交互的扩展点
 
 ```typescript
@@ -115,6 +123,23 @@ registerFlag(name: string,
 ```
 
 三个注册方法对应三种用户交互通道：斜杠命令（`/command`）、键盘快捷键、CLI flag。注意 `registerCommand` 的 handler 接收的是 `ExtensionCommandContext` — 比普通的 `ExtensionContext` 多了 `newSession()`、`fork()`、`navigateTree()` 等会话控制方法。这个区分很重要：只有**用户主动发起的命令**才有权做会话级操作，事件 handler 中不能 fork 或切换会话。
+
+#### 会话替换后 ctx 失效：`withSession` 模式（v0.69.0）
+
+这里有一个极易踩的坑。`newSession()`、`fork()`、`switchSession()` 会**替换底层会话对象** —— 调用之后，你手上原来的 `pi` / `ctx` 已经绑定在旧会话上，再用它做后续操作会抛错。正确做法是把"会话切换后要做的事"放进 `withSession` 回调，由系统在新会话就绪后回调给你一个全新的 `ReplacedSessionContext`：
+
+```typescript
+// extensions/types.ts:356,380（withSession 选项）
+await ctx.fork(entryId, {
+  position: "before",  // 从该 user 消息之前分叉
+  withSession: async (newCtx: ReplacedSessionContext) => {
+    // 在这里用 newCtx（而不是旧 ctx）继续操作新会话
+    newCtx.sendUserMessage("继续这个分支");
+  },
+});
+```
+
+`ReplacedSessionContext`（types.ts:380）专门作为 `newSession()` / `fork()` / `switchSession()` 的回调参数存在。规则可以浓缩成一句：**一旦你触发了会话替换，旧的 ctx 就作废了，后续逻辑只能走 `withSession`**。这是 extension 开发中最常见的运行时错误来源之一，却最不直觉。
 
 ### 能力 4：消息与状态持久化
 
@@ -148,6 +173,8 @@ unregisterProvider(name: string): void;
 ```
 
 这是最强大的扩展点之一。Extension 可以注册全新的 model provider（带自定义 baseUrl、API key、甚至 OAuth 流程），也可以覆盖已有 provider 的配置（比如把所有 Anthropic 请求路由到内部代理）。详见第 18 章。
+
+> **完整 provider 扩展（v0.81.0）**：此前 extension 在模型侧能做的相对有限 —— 主要是改模型定义、加工具。v0.81.0 起 extension 可以注册一个**完整的 pi-ai provider**：自带认证、模型刷新（`refreshModels`）、模型过滤、乃至自定义流式实现。也就是说 extension 不再只是"往已有 provider 上打补丁"，而能整个接管一类模型的接入 —— 一个企业内部网关、一个自研推理服务，都能作为一等 provider 挂进 pi 的 `Models` 运行时（第 18 章 `ModelRuntime` 装配 provider 时把 extension 注册一并纳入）。
 
 ## ExtensionUIContext — 系统表面上的 UI 接口
 
@@ -191,7 +218,7 @@ UI 方法分两类。**对话式方法**（`select`、`confirm`、`input`）返�
 
 ```typescript
 // 一个真实的 extension 示例
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default async function setup(pi: ExtensionAPI) {
   let turnCount = 0;
@@ -256,14 +283,20 @@ Loader 的关键设计：
 
 1. **串行加载**。Extension 按配置顺序逐个加载，不并行。这保证了注册顺序的确定性 — 先加载的 extension 的事件 handler 先执行。
 
-2. **jiti 动态导入**。Extension 是普通的 TypeScript 文件，通过 `@mariozechner/jiti`（一个 fork 版本，支持 `virtualModules`）在运行时编译和加载。这意味着 extension 不需要预编译。
+2. **jiti 动态导入**。Extension 是普通的 TypeScript 文件，通过上游 `jiti`（当前 `2.7.0`，支持 `virtualModules` 别名映射）在运行时编译和加载。这意味着 extension 不需要预编译。不过对 SDK 宿主，现在还有一条**内联**路径：`InlineExtension`（`types.ts:1491`，从包根导出）让宿主直接把一个 extension 对象交给 `createAgentSession`，不必先落一个磁盘文件再指路径 —— 适合"为一次嵌入临时挂一个 hook"的场景（第 26b 章）。
 
 3. **Virtual Modules**。编译后的 Bun binary 中没有 `node_modules`，extension 依赖的包通过 `virtualModules` 映射到 binary 中打包的静态导入：
 
 ```typescript
-// extensions/loader.ts:43-50
+// extensions/loader.ts:44-61
 const VIRTUAL_MODULES: Record<string, unknown> = {
-  "@sinclair/typebox": _bundledTypebox,
+  typebox: _bundledTypebox,
+  "@sinclair/typebox": _bundledTypebox,  // 旧名，向后兼容别名
+  "@earendil-works/pi-agent-core": _bundledPiAgentCore,
+  "@earendil-works/pi-tui": _bundledPiTui,
+  "@earendil-works/pi-ai": _bundledPiAi,
+  "@earendil-works/pi-coding-agent": _bundledPiCodingAgent,
+  // 旧 scope 名作为向后兼容别名同时注册：
   "@mariozechner/pi-agent-core": _bundledPiAgentCore,
   "@mariozechner/pi-tui": _bundledPiTui,
   "@mariozechner/pi-ai": _bundledPiAi,
@@ -271,7 +304,7 @@ const VIRTUAL_MODULES: Record<string, unknown> = {
 };
 ```
 
-这些 import 必须是静态的（`import * as`），否则 Bun 不会打包。这是一个不太常见的"静态依赖支撑动态加载"的模式。
+这些 import 必须是静态的（`import * as`），否则 Bun 不会打包。这是一个不太常见的"静态依赖支撑动态加载"的模式。注意 loader 同时注册了 `@earendil-works/pi-*`（当前 canonical 名）与 `@mariozechner/pi-*`（迁移前的旧名）两套 key —— 这样 scope 迁移后，仍引用旧包名的存量 extension 不必改动即可继续解析。
 
 ### Runtime：两阶段初始化
 
@@ -405,7 +438,12 @@ graph TB
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。Extension API 持续扩展中 —
-> `setWidget`、`setFooter`、`setHeader`、`onTerminalInput` 都是近期添加的。
-> `setEditorComponent` 允许完全替换输入编辑器，是最新的扩展点。
-> `ExtensionUIContext` 的接口随用户反馈和 extension 开发者的需求不断增长。
+> 本章核心分析基于 pi-mono v0.66.0，已对照 **v0.82.1**。Extension API 持续扩展，几处设计级变化：
+> ① **完整 provider 扩展**（v0.81.0）：extension 可注册完整 pi-ai provider（认证/模型刷新/过滤/自定义流式），此前只能改模型定义/加工具；
+> ② 新增三个 hook `before_provider_headers`（types.ts:681）、`agent_settled`（:718）、`session_info_changed`（:566），以及 `InlineExtension`（:1491）内联声明；
+> ③ **cache-friendly 动态工具加载**（v0.80.7）：运行中激活的扩展工具在受支持的 Anthropic/OpenAI Responses 模型上保留 prompt-cache 前缀（配合 Kimi native deferred tool loading）；
+> ④ 参数 schema 从 `@sinclair/typebox` 迁到 `typebox` 1.x（v0.69.0，旧名仍作别名）；
+> ⑤ 工具选择改为字符串名字白名单 `tools: string[]` + cwd 工厂（v0.68.0，移除预构建工具对象）；
+> ⑥ `newSession()`/`fork()`/`switchSession()` 后旧 ctx 失效，须用 `withSession` 回调（v0.69.0）；
+> ⑦ 早期的 `after_provider_response`、`message_end`（可替换 finalized 消息）、`project_trust` 等干预型 hook 仍在，事件总数已超早期的 26 种；jiti 切到上游 `2.7.0`，VIRTUAL_MODULES 同时注册新旧 scope 别名。
+> `setWidget`/`setFooter`/`setHeader`/`setEditorComponent` 等 UI 扩展点随需求持续增长（`outputPad` 也在 v0.82.1 暴露给自定义消息渲染器）。两阶段初始化与"开放但有边界"的内核保护始终不变。

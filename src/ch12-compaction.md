@@ -266,15 +266,17 @@ function serializeConversation(messages: Message[]): string {
 pi 使用一个专门的 system prompt 来指导摘要生成：
 
 ```typescript
-// packages/coding-agent/src/core/compaction/utils.ts:168-170
+// packages/coding-agent/src/core/compaction/utils.ts:168
 
 const SUMMARIZATION_SYSTEM_PROMPT =
   `You are a context summarization assistant. Your task is to read a conversation ` +
-  `between a user and an AI coding assistant, then produce a structured summary ` +
+  `between a user and an AI assistant, then produce a structured summary ` +
   `following the exact format specified.\n\n` +
   `Do NOT continue the conversation. Do NOT respond to any questions in the ` +
   `conversation. ONLY output the structured summary.`;
 ```
+
+> **措辞中性化（v0.79.0）**：注意这里是"an AI **assistant**"而非早期的"an AI **coding** assistant"。这是一个看似微小、实则有意的改动 —— compaction 的内核（连同 `AgentSession`）现在被设计为可被**非编码场景的 SDK 调用方**复用（见第 26b 章 SDK）。把摘要 prompt 里的"coding"去掉，让同一套压缩逻辑在客服、写作等非编码 agent 里也不显得突兀。
 
 用户 prompt 则要求生成结构化的 checkpoint 摘要，包含固定的六个章节：Goal、Constraints & Preferences、Progress（Done / In Progress / Blocked）、Key Decisions、Next Steps、Critical Context。
 
@@ -294,6 +296,8 @@ promptText += basePrompt;
 ```
 
 这种"增量更新"策略避免了随着压缩次数增加，摘要质量递减的问题。每次压缩都以上次摘要为基础，只需要处理新增的消息。
+
+关于"用什么配置去跑这次摘要"，有几个后来调整的细节：摘要**不再强制用 high thinking level**，而是复用会话当前的 thinking level（`createSummarizationOptions(..., thinkingLevel)`，compaction.ts:603；仅当 `model.reasoning && thinkingLevel !== "off"` 时才设 `options.reasoning`，:536）—— 强制 high 在便宜模型或关思考的会话里既费钱又没必要。摘要请求走的是会话自定义的 agent stream 函数，以保留代理路由等设置（v0.75.0）；`maxTokens` 会被钳到模型上限以内（v0.74.1），避免请求超过模型能力。
 
 ## 切点检测：保留多少、摘要多少
 
@@ -363,6 +367,8 @@ function findCutPoint(entries, startIndex, endIndex, keepRecentTokens) {
 - `tokensBefore`：压缩前的 context token 数，用于展示"从 185K 压缩到 20K"
 - `details`：结构化的文件列表，下次压缩时会被继承
 
+> **重复压缩的区间起点与 tokensBefore 重算**：当一个会话被**多次压缩**时，新一轮要摘要的区间并非从"上一条 CompactionEntry"开始，而是从**上一次压缩保留的边界 `firstKeptEntryId`** 开始；如果那条 kept entry 在当前路径里找不到，则回退到"上一条 CompactionEntry 之后的那条 entry"。这样能把上一轮幸存下来的消息也纳入本轮摘要，不至于丢失。此外，pi 在写新的 `CompactionEntry` 之前，会从**重建后的会话上下文**重新计算 `tokensBefore`，让这个数字真实反映"本次被替换掉的压缩前上下文"，而不是沿用一个过时的旧值（docs/compaction.md）。
+
 ### Extension 可以接管 Compaction
 
 `CompactionEntry` 有一个 `fromHook` 字段：
@@ -383,6 +389,42 @@ interface CompactionEntry<T = unknown> {
 当 `fromHook: true` 时，pi 知道这个压缩不是自己生成的，在处理时会更保守（比如不继承其文件列表）。
 
 Extension 为什么要接管 compaction？因为不同的 agent 场景对"什么信息重要"的判断不同。一个代码审查 agent 可能想保留所有 diff 细节，而一个项目管理 agent 可能只想保留决策点。默认的 compaction 策略无法满足所有场景。
+
+## 可恢复的压缩：重试、会计与路由隔离
+
+压缩本身是一次 LLM 调用，它会失败 —— 网络抖动、provider 限流、超时。早期一旦摘要请求失败，这一轮压缩就丢了，用户可能撞上 context overflow。本区间把压缩/分支摘要做成了**可恢复**的。
+
+**可配置的重试策略 + 生命周期事件（v0.81.1）。** 摘要请求现在走和普通 LLM 调用一样的重试逻辑（`RetryPolicy`），并把重试过程作为一组 `summarization_retry_*` 事件暴露出来（交互 / JSON / RPC / SDK 都能收到，`agent-session.ts:167-181`）：
+
+```typescript
+// packages/coding-agent/src/core/agent-session.ts:167-181（节选）
+| { type: "summarization_retry_scheduled";
+    attempt: number; maxAttempts: number;
+    delayMs: number; errorMessage: string }
+| { type: "summarization_retry_attempt_start";
+    source: "compaction";
+    reason: "manual" | "threshold" | "overflow" }
+| { type: "summarization_retry_finished" }
+```
+
+`reason` 区分了压缩的三种触发来源 —— 手动 `/compact`、阈值自动触发、以及 overflow 溢出重试；`willRetry` 则告诉消费者这次失败之后还会不会再试。这让宿主能给用户一个诚实的"正在重试压缩（第 2/3 次）"提示，而不是静默卡住。压缩事件还带上**估算的压缩后 token 数**（v0.79.8），让 UI 能显示"从 185K 压到约 20K"这样的预期结果。（这套产品层的 `summarization_retry_*` 与第 10 章 `AgentHarness` 内核里的 `RetryPolicy` / `retry_*` 是**不同层的同构机制** —— 都在"要额外调 LLM 的摘要请求"上加重试，但一个跑在 coding-agent 产品层、一个跑在 agent 内核，彼此独立。）
+
+**usage 会计扩展到工具/压缩/分支摘要（v0.81.0）。** 早期只有主对话的 assistant 响应计入会话 token 总计。现在工具调用、压缩、分支摘要各自消耗的 usage 都被持久化并计入会话总计、footer 和会话统计（`docs/compaction.md`）。这修正了一个长期的低估 —— 压缩本身要读一大堆旧消息、生成摘要，这些 token 此前是"隐形"的。
+
+**压缩请求隔离路由并禁用 prompt caching（v0.82.0）。** 摘要是**独立的一次性请求**，它和主对话共享缓存前缀既没有意义、又会污染主对话的缓存。所以压缩/分支摘要请求被显式地隔离出来：
+
+```typescript
+// packages/coding-agent/src/core/compaction/compaction.ts:570-574
+// Summaries are standalone requests, so isolate routing and
+// avoid cache writes that cannot be reused.
+const requestOptions: SimpleStreamOptions = {
+  ...options,
+  cacheRetention: "none",   // 不写 prompt cache
+  sessionId: uuidv7(),      // 全新 routing session id
+};
+```
+
+`sessionId` 用一个全新的 `uuidv7()`，让 provider 端按 id 路由时不会把摘要请求和主对话归到一起；`cacheRetention: "none"` 则避免为一次用不上的请求写缓存。同时，纯 header 认证的 provider 现在也能跑压缩了（v0.82.1）—— 摘要请求不再假设一定有 API key 形式的凭证。
 
 ## Compaction 在产品层而非 Runtime 层
 
@@ -467,7 +509,5 @@ return { summary, firstKeptEntryId, tokensBefore, details: { readFiles, modified
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。Compaction 的核心策略保持稳定。
-> 文件操作追踪（`CompactionDetails`）和 extension 接管（`fromHook`）是后来添加的增强。
-> `BranchSummaryEntry` 作为独立的分支摘要类型也是后来从 compaction 中分离出来的。
-> 增量更新摘要（`UPDATE_SUMMARIZATION_PROMPT` + `previousSummary`）是后期加入的优化。
+> 本章核心分析基于 pi-mono v0.66.0，已对照 **v0.82.1**。Compaction 的核心数据模型（9 种 entry、reserveTokens/keepRecentTokens、增量更新摘要、CompactionDetails、fromHook 接管、BranchSummaryEntry）保持稳定。
+> 主要演进：① **可恢复压缩**（v0.81.1）—— 摘要/分支摘要可配置重试策略 + `summarization_retry_*` 生命周期事件（交互/JSON/RPC/SDK 均可见），压缩事件带 `reason`/`willRetry`（v0.79.10）与估算压缩后 token 数（v0.79.8）；② **usage 会计扩展**（v0.81.0）—— 工具/压缩/分支摘要 usage 计入持久化会话总计、footer 与统计；③ **压缩请求隔离路由 + 禁用 prompt caching**（v0.82.0，`cacheRetention:"none"` + 全新 `sessionId`），纯 header 认证 provider 也能压缩（v0.82.1）；④ 摘要不再强制 high thinking，复用会话当前级别（v0.68.0），走自定义 agent stream 保留代理路由（v0.75.0），maxTokens 钳到模型上限（v0.74.1）；⑤ 摘要 system prompt 中性化为"AI assistant"以便非编码 SDK 复用（v0.79.0）；⑥ 重复压缩从上次 `firstKeptEntryId` 起算区间、写入前从重建上下文重算 `tokensBefore`。

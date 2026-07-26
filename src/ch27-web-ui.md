@@ -4,6 +4,8 @@
 > 前置依赖：第 4 章（Provider Registry）、第 24 章（pi-tui）。
 > 适用场景：当你想理解 pi 的 Web 组件库。
 
+> **历史快照说明**：`pi-web-ui` 包已于 commit `b141e1fa`（2026-05-20）从 pi-mono 主仓库移出，且没有官方继任仓库。本章的全部分析、包名（`@mariozechner/pi-web-ui`）与版本号均基于 v0.66.1 历史快照（commit `c779c14e`）——当时该包仍在 `packages/web-ui/`。保留本章，是因为它演示的"Web 宿主复用同一内核"设计论点仍然成立（参见第 2 章关于包移出标准的讨论），但请勿据此在当前主仓库中查找对应代码。
+
 ## 浏览器里的 pi
 
 `pi-web-ui` 是一组 Lit Web Components + Tailwind CSS 构建的可复用组件：聊天消息、模型选择器、文档预览（docx、pdf、xlsx）。

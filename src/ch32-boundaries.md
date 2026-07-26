@@ -146,7 +146,8 @@ Vercel AI SDK 是轻量级方案。迁移到 pi 通常是因为需要更复杂�
 ```
 packages/
 ├── ai/src/
-│   ├── api-registry.ts       # 添加 provider 的入口
+│   ├── models.ts              # Models 集合 / createProvider（添加 provider 的入口）
+│   ├── providers/             # 各内建 provider 的 factory
 │   ├── types.ts               # Model, Context, StreamFunction 类型
 │   └── models.json            # 模型定义（id, cost, contextWindow）
 ├── agent/src/

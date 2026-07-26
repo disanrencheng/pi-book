@@ -246,7 +246,7 @@ Resource Loader 还负责加载项目上下文文件（`AGENTS.md` 或 `CLAUDE.m
 
 ```typescript
 // file: packages/coding-agent/src/core/resource-loader.ts:76-113
-function loadProjectContextFiles(options: { cwd?: string }) {
+function loadProjectContextFiles(options: { cwd: string; agentDir: string }) {
   const contextFiles = [];
   // 1. 先加载全局上下文（~/.pi/agent/ 下的 AGENTS.md）
   const globalContext = loadContextFileFromDir(resolvedAgentDir);
@@ -275,6 +275,53 @@ function loadProjectContextFiles(options: { cwd?: string }) {
 
 所有找到的文件**按顺序拼接**（不覆盖），作为项目上下文注入 system prompt。这个设计让组织可以在不同层级的目录中放置不同粒度的上下文 — 根目录放通用规范，子目录放模块特定的上下文。
 
+### 边界：跳过与 context 文件同名的目录（#7106）
+
+`loadContextFileFromDir` 在每个目录里按候选名（`AGENTS.md` / `CLAUDE.md` 及大写变体）找 context 文件。这里有一个真实踩到的坑：候选名指向的路径**未必是文件** —— 有人会建一个叫 `AGENTS.md` 的**目录**（比如把多份 agent 说明拆成 `AGENTS.md/foo.md`）。早期代码直接 `readFileSync` 这个路径，撞上目录就抛 `EISDIR`，整个上下文加载失败。v0.82.1 的修复（#7106）加了一道 `isFile` 判断：
+
+```typescript
+// packages/coding-agent/src/core/resource-loader.ts:69-78（节选）
+for (const filename of candidates) {
+  const filePath = join(dir, filename);
+  if (existsSync(filePath)) {
+    if (!statSync(filePath).isFile()) {
+      continue;           // 同名的是目录 → 跳过，继续试下一个候选
+    }
+    return { path: filePath, content: readFileSync(filePath, "utf-8") };
+  }
+}
+```
+
+`if (!statSync(filePath).isFile()) continue;`（`resource-loader.ts:73`）让发现逻辑在遇到"同名目录"时静默跳过、继续尝试下一个候选名，而不是崩掉。这是"宽容加载"原则在一个刁钻边界上的体现 —— 一个非常规的目录布局不该让整个会话起不来。
+
+### 与 ch13 的项目本地资源覆盖是同一作用域
+
+本章的资源分层（全局 → 项目 → npm 包）和第 13 章的 `settings.json` 分层（全局 → 项目）其实是**同一个"全局/项目本地"作用域概念**的两面：一个管 extensions/skills/prompts/themes，一个管结构化 settings。第 13 章讲的 `pi config -l`、交互编辑器里 Tab 切换全局/项目作用域，改的正是本章"项目后加载、覆盖全局"里的"项目"那一层。两章合起来，才是完整的"项目本地资源覆盖"图景 —— 而它们都统一受下节的 Project Trust 闸门管辖。
+
+## 显式 cwd：去掉 process.cwd() 兜底（v0.68.0）
+
+注意上面 `loadProjectContextFiles` 的签名 —— `cwd` 是**必填**的，不再是早期的可选参数。这是一个看似琐碎、实则贯穿全局的设计纪律。早期版本里 `DefaultResourceLoader`、`loadProjectContextFiles()`、`loadSkills()`（skills.ts:387）等都会在 `cwd` 缺省时回退到 `process.cwd()`。v0.68.0 起，这个隐式兜底被移除：调用方**必须显式传入**工作目录。
+
+去掉 `process.cwd()` 兜底的动机是：pi 不再假设"只有一个全局当前目录"。同一个进程里可能同时存在多个会话、多个工作目录（RPC 模式、SDK 嵌入、子 agent），任何依赖进程级全局状态的代码都会在这些场景下出错。把 `cwd` 提升为显式必填参数，等于在类型层面强制每一处资源加载都说清楚"相对谁解析"。这条"去 process-global"的纪律同样体现在 system prompt 装配（第 14 章 `buildSystemPrompt` 的 cwd 必填）与各工具的 cwd 工厂（第 19 章）上 —— 它是 pi 走向"可嵌入库"（第 26b 章 SDK）的前提。
+
+## 项目本地资源受信任门控（v0.79.0）
+
+本章开头的加载流程图把规则简化为"全局先加载、项目后加载、npm 包最后加载"。从 **v0.79.0** 起，这个流程在"全局"与"项目"之间多了一道**信任闸门**：项目本地的 extensions / skills / prompts / packages / settings 都是可执行的攻击面（extension 跑代码、packages 拉取并加载 npm/git 代码、AGENTS.md 注入 prompt），因此在加载它们之前，`reload()` 会先经过 Project Trust 决策。
+
+```mermaid
+flowchart TD
+    Reload["reload()"] --> G["加载全局资源<br/>~/.pi/agent/（始终信任）"]
+    G --> Gate{"项目受信任?<br/>isProjectTrusted()"}
+    Gate -->|是| P["加载项目本地 + npm 包资源"]
+    Gate -->|否| Decide{"defaultProjectTrust / --approve / 交互询问"}
+    Decide -->|信任| P
+    Decide -->|拒绝| Skip["跳过项目本地资源<br/>仅全局资源生效"]
+    P --> Out["统一资源集合"]
+    Skip --> Out
+```
+
+具体地说：全局作用域的资源无条件加载；项目作用域的资源是否加载，取决于 `isProjectTrusted()`（extension 也能经 `ctx.isProjectTrusted()` 查询，见第 15 章）。非交互场景下由全局设置 `defaultProjectTrust`（`ask`/`always`/`never`）或 CLI `--approve` 决定，交互场景下弹出 `/trust` 询问。换句话说，本章原先"项目资源总是会加载"的假设在 v0.79.0 后不再成立 —— 它现在是一个**经信任决策后**才发生的步骤。信任闸门的完整设计见第 13 章。
+
 ## 取舍分析
 
 ### 得到了什么
@@ -294,5 +341,9 @@ function loadProjectContextFiles(options: { cwd?: string }) {
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。Resource Loader 的来源随着 npm 包支持的加入
-> 从两级（全局 + 项目）扩展到了三级。
+> 本章核心分析基于 pi-mono v0.66.0，已对照 **v0.82.1**。几处设计级变化：
+> ① **上下文文件发现跳过同名目录**（v0.82.1，#7106）：`loadContextFileFromDir` 加 `if (!statSync(filePath).isFile()) continue;`（`resource-loader.ts:73`），避免叫 `AGENTS.md` 的目录导致 `EISDIR`。
+> ② **显式 cwd 必填**（v0.68.0）：`DefaultResourceLoader`/`loadProjectContextFiles`/`loadSkills` 移除 `process.cwd()` 兜底，cwd 必须显式传入（"去 process-global"纪律）。
+> ③ **项目本地资源受 Project Trust 门控**（v0.79.0）：reload 在全局与项目加载之间插入信任闸门，项目资源不再无条件加载；项目本地资源覆盖与第 13 章 `pi config -l` 作用域切换同属一个概念。
+> ④ 兄弟 npm 扩展保留相对路径显示、恢复会话时资源通知保持在消息前（v0.82.0/v0.80.3）。
+> 资源来源仍是全局 + 项目 + npm 包三级；`extendResources` 运行时扩展与 override 机制保持不变。

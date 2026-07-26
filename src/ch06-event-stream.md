@@ -17,7 +17,7 @@
 pi-ai 层最重要的一段注释在 `types.ts` 的 `StreamFunction` 类型定义上：
 
 ```typescript
-// packages/ai/src/types.ts:117-129
+// packages/ai/src/types.ts:303-315
 
 // Contract:
 // - Must return an AssistantMessageEventStream.
@@ -47,7 +47,7 @@ export type StreamFunction<TApi extends Api, TOptions extends StreamOptions> = (
 ### 完整实现
 
 ```typescript
-// packages/ai/src/utils/event-stream.ts:4-66
+// packages/ai/src/utils/event-stream.ts:4-48（节选）
 
 export class EventStream<T, R = T> implements AsyncIterable<T> {
   private queue: T[] = [];
@@ -56,13 +56,9 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
   private finalResultPromise: Promise<R>;
   private resolveFinalResult!: (result: R) => void;
 
-  constructor(
-    private isComplete: (event: T) => boolean,
-    private extractResult: (event: T) => R,
-  ) {
-    this.finalResultPromise = new Promise((resolve) => {
-      this.resolveFinalResult = resolve;
-    });
+  constructor(private isComplete: (event: T) => boolean,
+              private extractResult: (event: T) => R) {
+    this.finalResultPromise = new Promise((r) => { this.resolveFinalResult = r; });
   }
 
   push(event: T): void {
@@ -72,27 +68,21 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
       this.resolveFinalResult(this.extractResult(event));
     }
     const waiter = this.waiting.shift();
-    if (waiter) {
-      waiter({ value: event, done: false });
-    } else {
-      this.queue.push(event);
-    }
+    if (waiter) waiter({ value: event, done: false });
+    else this.queue.push(event);
   }
 
   end(result?: R): void {
     this.done = true;
-    if (result !== undefined) {
-      this.resolveFinalResult(result);
-    }
+    if (result !== undefined) this.resolveFinalResult(result);
     while (this.waiting.length > 0) {
-      const waiter = this.waiting.shift()!;
-      waiter({ value: undefined as any, done: true });
+      this.waiting.shift()!({ value: undefined as any, done: true });
     }
   }
 ```
 
 ```typescript
-// packages/ai/src/utils/event-stream.ts:49-66
+// packages/ai/src/utils/event-stream.ts:50-66
 
   async *[Symbol.asyncIterator](): AsyncIterator<T> {
     while (true) {
@@ -193,7 +183,7 @@ const message = await stream(model, context, options).result();
 通用的 `EventStream<T, R>` 需要被具体化为 LLM 响应场景。这就是 `AssistantMessageEventStream` 的工作：
 
 ```typescript
-// packages/ai/src/utils/event-stream.ts:68-82
+// packages/ai/src/utils/event-stream.ts:69-83
 
 export class AssistantMessageEventStream
   extends EventStream<AssistantMessageEvent, AssistantMessage> {
@@ -225,7 +215,7 @@ export class AssistantMessageEventStream
 ### 生命周期事件
 
 ```typescript
-// packages/ai/src/types.ts:238
+// packages/ai/src/types.ts:492
 | { type: "start"; partial: AssistantMessage }
 ```
 
@@ -234,7 +224,7 @@ export class AssistantMessageEventStream
 ### 文本内容事件
 
 ```typescript
-// packages/ai/src/types.ts:239-241
+// packages/ai/src/types.ts:493-495
 | { type: "text_start"; contentIndex: number; partial: AssistantMessage }
 | { type: "text_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 | { type: "text_end"; contentIndex: number; content: string; partial: AssistantMessage }
@@ -249,7 +239,7 @@ export class AssistantMessageEventStream
 ### Thinking 事件
 
 ```typescript
-// packages/ai/src/types.ts:242-244
+// packages/ai/src/types.ts:496-498
 | { type: "thinking_start"; contentIndex: number; partial: AssistantMessage }
 | { type: "thinking_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 | { type: "thinking_end"; contentIndex: number; content: string; partial: AssistantMessage }
@@ -260,7 +250,7 @@ export class AssistantMessageEventStream
 ### Tool Call 事件
 
 ```typescript
-// packages/ai/src/types.ts:245-247
+// packages/ai/src/types.ts:499-501
 | { type: "toolcall_start"; contentIndex: number; partial: AssistantMessage }
 | { type: "toolcall_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
 | { type: "toolcall_end"; contentIndex: number; toolCall: ToolCall; partial: AssistantMessage }
@@ -275,9 +265,9 @@ export class AssistantMessageEventStream
 ### 终止事件
 
 ```typescript
-// packages/ai/src/types.ts:248-249
-| { type: "done"; reason: "stop" | "length" | "toolUse"; message: AssistantMessage }
-| { type: "error"; reason: "error" | "aborted"; error: AssistantMessage }
+// packages/ai/src/types.ts:502-503
+| { type: "done"; reason: Extract<StopReason, "stop" | "length" | "toolUse">; message: AssistantMessage }
+| { type: "error"; reason: Extract<StopReason, "aborted" | "error">; error: AssistantMessage }
 ```
 
 终止事件是整个事件协议中最关键的部分。它分为两种：
@@ -307,15 +297,17 @@ export class AssistantMessageEventStream
 无论流式消费还是一次性消费，最终拿到的都是 `AssistantMessage`：
 
 ```typescript
-// packages/ai/src/types.ts:190-201
+// packages/ai/src/types.ts:390-403
 
 export interface AssistantMessage {
   role: "assistant";
   content: (TextContent | ThinkingContent | ToolCall)[];
   api: Api;
-  provider: Provider;
+  provider: ProviderId;
   model: string;
+  responseModel?: string;   // 路由后的实际模型（如 OpenRouter auto）
   responseId?: string;
+  diagnostics?: AssistantMessageDiagnostic[]; // 脱敏的失败/恢复诊断
   usage: Usage;
   stopReason: StopReason;
   errorMessage?: string;
@@ -328,9 +320,11 @@ export interface AssistantMessage {
 - **`role: "assistant"`** — 固定值。与 `UserMessage`（`role: "user"`）和 `ToolResultMessage`（`role: "toolResult"`）一起构成三种消息类型，用于对话历史的类型区分。
 - **`content: (TextContent | ThinkingContent | ToolCall)[]`** — 内容数组。一次响应可以包含多种类型的内容块：纯文本（`TextContent`）、思考过程（`ThinkingContent`）、工具调用（`ToolCall`）。数组的顺序对应模型输出的顺序。
 - **`api: Api`** — 使用的 API 类型，如 `"anthropic-messages"` 或 `"openai-responses"`。
-- **`provider: Provider`** — 使用的 provider，如 `"anthropic"` 或 `"openai"`。
+- **`provider: ProviderId`** — 使用的 provider 标识，如 `"anthropic"` 或 `"openai"`。类型是 `ProviderId`（`KnownProvider | string`），v0.80.0 起从旧名 `Provider` 改来 — 现在 `Provider` 指运行时 provider 接口（第 4 章）。
 - **`model: string`** — 实际使用的模型名称，如 `"claude-sonnet-4-20250514"`。
 - **`responseId?: string`** — 上游 API 返回的响应标识符（可选）。不同 provider 的含义不同。
+- **`responseModel?: string`** — 当上游路由后的实际模型与请求的 `model` 不同时填充（如 OpenRouter 的 `auto` 路由到 `anthropic/...`，v0.71.0 引入）。`model` 是"请求了什么"，`responseModel` 是"实际跑了什么"。
+- **`diagnostics?: AssistantMessageDiagnostic[]`** — 脱敏后的 provider/runtime 诊断，记录这次响应过程中的失败与恢复（如重试、降级），用于可观测性而不泄露敏感请求内容（v0.59.0 起）。
 - **`usage: Usage`** — token 使用统计，包含 `input`、`output`、`cacheRead`、`cacheWrite`、`totalTokens`，以及对应的 `cost` 计算。
 - **`stopReason: StopReason`** — 停止原因。类型为 `"stop" | "length" | "toolUse" | "error" | "aborted"`，与终止事件的 reason 对应。
 - **`errorMessage?: string`** — 当 `stopReason` 为 `"error"` 或 `"aborted"` 时，携带错误描述。
@@ -339,13 +333,15 @@ export interface AssistantMessage {
 `Usage` 类型值得单独展开：
 
 ```typescript
-// packages/ai/src/types.ts:167-180
+// packages/ai/src/types.ts:359-380
 
 export interface Usage {
   input: number;
   output: number;
   cacheRead: number;
   cacheWrite: number;
+  cacheWrite1h?: number; // Anthropic 1 小时缓存写入的子集
+  reasoning?: number;    // 推理/思考 token（output 的子集）
   totalTokens: number;
   cost: {
     input: number;
@@ -357,7 +353,29 @@ export interface Usage {
 }
 ```
 
-`Usage` 同时记录 token 数量和费用。`cacheRead` 和 `cacheWrite` 是 prompt caching 相关的统计 — 不是所有 provider 都支持，不支持的填 0。`cost` 嵌套对象把 token 数量按各 provider 的价格转换成了美元金额，让上层不需要知道定价细节。
+`Usage` 同时记录 token 数量和费用。`cacheRead` 和 `cacheWrite` 是 prompt caching 相关的统计 — 不是所有 provider 都支持，不支持的填 0。`cacheWrite1h` 从 `cacheWrite` 中拆出"写入 1 小时 TTL 缓存"的那部分 token，目前只有 Anthropic 上报（用于更精确的缓存计费，v0.79.4）。`reasoning` 是 v0.80.3 新增的字段：它记录模型的推理/思考 token 数，是 `output` 的**子集**（`output` 已经把这些 token 算在内），只有暴露 reasoning 明细的 provider 会填一个数字（可能是 0），其余留 `undefined`。`cost` 嵌套对象把 token 数量按各 provider 的价格转换成了美元金额，让上层不需要知道定价细节。
+
+### `ToolResultMessage` 的两个增补字段
+
+对话历史的第三种消息 `ToolResultMessage` 也随版本长出了两个新字段：
+
+```typescript
+// packages/ai/src/types.ts:405-421（节选）
+
+export interface ToolResultMessage<TDetails = any> {
+  role: "toolResult";
+  toolCallId: string;
+  toolName: string;
+  content: (TextContent | ImageContent)[];
+  usage?: Usage;              // 工具自身执行的用量（不计入主 LLM 上下文核算）
+  addedToolNames?: string[];  // 本次结果后新变得可用的工具名
+  isError: boolean;
+  timestamp: number;
+}
+```
+
+- **`usage?: Usage`**（v0.81.0）— 有些工具本身就是一次 LLM 调用（例如子 agent、代码搜索），它们的 token 用量记在这里，与主循环的上下文核算分开，用于成本可观测性。
+- **`addedToolNames?: string[]`**（v0.80.7）— 支持"原生延迟工具加载"的 provider 用它作为**加载点**：某个工具结果返回后才让一批新工具变得可用（`Context.tools` 里的名字）。不支持原生延迟加载的 provider 忽略这个字段，照常使用 `Context.tools`。这是把"工具集随对话动态生长"这件事编码进消息模型的一个精巧扩展点。这批新工具名如何在循环里被解析并传播，见第 9 章。
 
 ## 一次典型 LLM 响应的事件序列
 
@@ -434,9 +452,30 @@ sequenceDiagram
 
 **4. `partial` 的内存开销**。每个中间事件都携带完整的 `partial` AssistantMessage 快照。对于一个长回答，可能有数百个 delta 事件，每个都带一份完整快照。这是用内存换取消费者的简单性。
 
+## `StreamOptions`：事件流之下的扩展点
+
+事件流的"形状"稳定，但**发起一次流**的入口 `StreamOptions` 随版本显著扩张（`types.ts:115-191`）。这些字段不改变事件协议，而是在协议之下提供 hook 和传输层旋钮：
+
+- **`transport?: Transport`** — `"sse" | "websocket" | "websocket-cached" | "auto"`。事件流是上层抽象，底下走什么传输由它决定。`websocket-cached`（v0.71.1）让 OpenAI Codex Responses 用一条保活的 WebSocket 连接跨请求只发送**新增**的对话项，而不是每次重发整个上下文 —— 事件流的消费者完全无感。
+- **`onPayload?`** — 在请求发出**前**改写 provider payload（由早期的 beforeProviderRequest 演化而来），用于注入自定义头部、改写参数。
+- **`onResponse?`** — 在拿到响应后读取 HTTP 状态码与响应头（v0.67.6），用于配额提示、调试。
+- **`env?`** — provider 级的环境变量覆盖（v0.79.5），让同一进程内不同请求使用不同的 API key / 代理 / 区域占位符（Cloudflare、Azure、Vertex、Bedrock）。
+- 还有 `timeoutMs` / `maxRetries` / `maxRetryDelayMs` / `cacheRetention` / `sessionId` / `metadata` 等运行时旋钮。
+
+同一条"契约稳定、旋钮生长"的主线还延伸到两个相邻的扩展点，它们同样不碰事件协议：
+
+- **`Tool.constrainedSampling`**（`types.ts:474`，v0.80.4/0.82.0）— 让工具声明 provider 侧的约束采样配置（`ConstrainedSamplingConfig`，`types.ts:460`），把"这个工具的参数必须严格符合 schema / 语法"的意图下推给支持约束解码的 provider（对应 `supportsStrictTools`/`supportsGrammarTools` 能力元数据）。完整取值联合详见第 19 章。事件流的消费者对此完全无感 — 收到的仍是同样的 `toolcall_*` 事件，只是模型更不容易吐出非法参数。
+- **`ModelsStreamTransforms.transformHeaders`**（`models.ts:58-61`，v0.80.8）— 这是一个 **Models-only** 的选项（只在 `Models.stream()` 上有效，不属于底层 provider 的 `StreamOptions`）。它在模型/认证/请求三方的 header 全部拼装完成、即将交给 provider 之前，给上层最后一次改写机会（`models.ts:480`：`headers = await options.transformHeaders(headers ?? {})`）。`Models` 用完就把它从选项里剥掉，不会泄漏给 provider。这正体现了 v0.80.0 后 `Models` 集合作为"认证与请求装配层"的新职责。
+
+这是 pi-ai 的一条设计主线：**事件流契约对上不变，传输与拦截能力对下生长**。消费者面对的永远是同一套 12 种事件，而 provider 与上层产品通过 `StreamOptions`（以及 `Models` 集合的 `transformHeaders`）协商越来越多的细节。
+
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。事件流设计自 pi-ai 创建以来是最稳定的部分。
-> `EventStream` 类的实现几乎没有改变。事件类型随 provider 能力的增加而扩展
-> （比如 `thinking_start/delta/end` 是后来为支持 extended thinking 而添加的）。
+> 本章内容已对照 pi-mono **v0.82.1**。事件协议与 `EventStream` 类几乎未变 —— 这是 pi-ai 最稳定的部分。变化集中在数据模型与入口选项：
+> - **类型订正**：`AssistantMessage.provider` 的类型从 `Provider` 改为 `ProviderId`（v0.80.0，`types.ts:394`）；`Provider` 现指运行时接口。
+> - `Usage` 新增 `reasoning`（v0.80.3）、`cacheWrite1h`（v0.79.4）；`AssistantMessage` 有 `responseModel`（v0.71.0）、`diagnostics`（v0.59.0）。
+> - `ToolResultMessage` 新增可选 `usage`（v0.81.0）与 `addedToolNames`（v0.80.7）。
+> - 扩展点扩张：`Tool.constrainedSampling`（v0.80.4/0.82.0）、Models-only 的 `transformHeaders`（v0.80.8）；`StreamOptions` 继续扩展（transport / onPayload / onResponse / env 等）。
+> - 事件类型随 provider 能力增加而扩展（如 `thinking_start/delta/end` 为 extended thinking 而加）。
+> 对比：v0.74.1 新增的图像生成走的是 `Promise` 而非事件流（详见第 18 章），正好反衬"为什么文本生成需要事件流"。

@@ -80,6 +80,16 @@ export type RpcCommand =
   // ... 更多命令类型
 ```
 
+随产品演进，命令清单已远不止上面这些。除了 `prompt`/`steer`/`follow_up`/`abort`/`set_model`/`fork`/`export_html` 等早期命令，现在还包括（rpc-mode.ts）：
+
+- **会话**：`switch_session`（切换到已有会话）、`clone`（复制当前活动分支到新文件，与 `fork` 区别见第 11 章）、`get_last_assistant_text`、`get_commands`（列出可用命令）
+- **只读会话树（v0.80.3）**：`get_entries`（带 `since` 增量拉取此后追加的 entry）、`get_tree`（返回完整 `SessionTreeNode[]`）—— 让外部宿主也能渲染第 11 章那棵会话树（`rpc-types.ts:64-65`）
+- **压缩与重试**：`compact`（可带 `customInstructions`）、`set_auto_compaction`、`set_auto_retry` / `abort_retry`
+- **执行控制**：`abort_bash`、`cycle_thinking_level`、`set_steering_mode` / `set_follow_up_mode`
+- **思考档位**：`get_available_thinking_levels`（`rpc-types.ts:39`，返回当前模型支持的档位，配套 `RpcClient.getAvailableThinkingLevels()`；`max`/`xhigh` 也在此暴露）
+
+`fork` 与 `clone` 的区别值得强调：`fork` 从某条更早的消息开新分支，`clone` 复制当前整条活动路径——对应第 11 章的 `/fork` 与 `/clone`。
+
 几个设计要点：
 
 **`id` 是可选的**。客户端可以为每条命令指定一个 correlation ID，响应会带上同一个 ID，让客户端可以匹配请求和响应。对于不需要匹配的场景（比如 fire-and-forget 的 abort），可以省略 ID。
@@ -115,6 +125,15 @@ export type RpcResponse =
 响应的 TypeScript 类型是一个 discriminated union — 每种命令有自己的成功响应类型（带不同的 `data` 结构），但所有命令共享同一个错误响应类型。这让客户端可以先检查 `success` 字段，再根据 `command` 字段解析 `data`。
 
 **异步命令和同步命令的区别**。`prompt`、`steer`、`follow_up` 的成功响应不包含 data — 因为这些操作是异步的，真正的结果通过后续的事件流（AgentSessionEvent）传递。`get_state`、`get_messages` 是同步查询，结果直接在响应的 `data` 中返回。
+
+**`prompt` 的"单一权威响应" + preflight 契约（v0.67.3）**。`prompt` 命令对响应有一个明确约定：它**只回一次** `response`，且这个响应是一次 **preflight 裁决** —— 表示命令被 accepted / queued / handled。一旦命令被 accept，后续即便发生失败，也**只通过事件流**汇报，**不再发第二个 `response`**。换句话说，客户端可以安全地"一条 prompt 命令 ↔ 一个 response"地配对，而不必担心同一命令收到两次终态响应。这避免了早期"先 ack 再 error" 造成的客户端状态机混乱。另外，对**未知命令**的错误响应现在会带上原命令的 `id`（v0.79.7），让客户端能把错误关联回具体请求。
+
+### 事件流：命令之外的增量信号
+
+异步命令的真正结果走的是事件流（`AgentSessionEvent` 序列化成 JSON-L）。这条流本区间多了两类事件：
+
+- **`bash_execution_update`**（`agent-session.ts:181`，v0.82.0）：直连 RPC 执行 bash 时，命令输出**边产生边流式**吐给客户端（`{ type: "bash_execution_update", id?, delta }`），而不是等命令结束才一次性给结果 —— 让 IDE 能像 TUI 一样实时显示 bash 输出（对应第 22 章的流式 `onData`）。
+- **`summarization_retry_*`**（`agent-session.ts:167-181`，v0.81.1）：压缩/分支摘要失败重试时，`summarization_retry_scheduled` / `_attempt_start` / `_finished` 三个事件把重试过程透出给客户端（对应第 12 章的可恢复压缩）。客户端据此能显示"正在重试压缩"而非静默卡住。
 
 ## 会话状态
 
@@ -218,6 +237,8 @@ export async function runRpcMode(
   };
 ```
 
+除了 `pi --mode rpc` 这个 CLI 入口，包还导出了一个 **`./rpc-entry`** 子路径入口（v0.80.3）：`import "@earendil-works/pi-coding-agent/rpc-entry"` 会直接以 RPC 模式启动整个进程。这对"想 spawn 一个纯 RPC 子进程、又不想拼 CLI 参数"的宿主很方便 —— 子进程的 entry 就是这一个 import。
+
 `takeOverStdout()` 劫持了 `console.log` 和 `process.stdout.write`，防止其他代码意外向 stdout 写入非 JSON 内容。这是 RPC 模式的核心防御 — stdout 是协议通道，任何非 JSON 输出都会破坏客户端的解析。
 
 `writeRawStdout` 绕过了劫持层直接写入 stdout。只有 RPC 层自己可以往 stdout 写数据。
@@ -253,7 +274,13 @@ RPC 命令和 Agent API 的对应关系：
 | `bash` | direct bash execution |
 | `fork` | `session.fork()` |
 
-这个映射几乎是一对一的。RPC 层不添加业务逻辑 — 它只做序列化/反序列化和 stdout 保护。这种薄层设计让 RPC 的行为和 interactive 模式完全一致。
+这个映射几乎是一对一的。RPC 层不添加业务逻辑 — 它只做序列化/反序列化和 stdout 保护。这种薄层设计让 RPC 的行为和 interactive 模式完全一致。其中 `bash` 命令也透传了 `excludeFromContext` 选项（v0.76.0）——RPC 客户端可以执行命令、拿到输出、但让输出不进入 LLM 上下文（对应第 22 章的 `!!` 前缀）。
+
+## 自带 typed client：`RpcClient`
+
+外部进程当然可以自己手写 JSON-L 的收发，但 pi 从 v0.67.67 起**直接从包根导出了一个 typed client** `RpcClient`（连同 `RpcClientOptions`，index.ts:315）。它封装了"spawn 子进程、按行 framing、按 `id` 关联请求与响应、订阅事件流"这些样板，让 Node 调用方用类型安全的方法调用代替手拼 JSON。子进程退出时，所有 pending 请求会被 reject（v0.76.0），不会让调用方永久挂起。
+
+> **LF framing 陷阱**：RPC 是严格的"一行一条消息"协议，分隔符是 `\n`。这里有一个**不能用 Node 内置 `readline`** 的坑 —— `readline` 会把 Unicode 行分隔符 `U+2028`/`U+2029` 也当成换行，而这些字符完全可能出现在 LLM 生成的内容里，一旦被误当行边界，整条 JSON 就被切碎、解析失败。因此 RPC 的 framing 必须严格只按 `\n` 切分。配套地，往 stdout 写时还要处理背压：写满时重试 / flush，避免大块事件输出被截断（v0.76.0）。如果你要自己实现客户端而不用 `RpcClient`，这是必须自己复刻的细节。
 
 ## 取舍分析
 
@@ -272,6 +299,6 @@ RPC 命令和 Agent API 的对应关系：
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。RPC 模式为 IDE 集成而创建，
-> 支持的操作类型随 IDE 插件的需求不断扩展。Extension UI 桥接
-> 是较晚添加的能力，早期版本的 RPC 不支持 extension 的 UI 交互。
+> 本章核心分析基于 pi-mono v0.66.0，已对照 **v0.82.1**。RPC 的 JSON-L over stdio、薄层映射、Extension UI 桥接保持不变。
+> 主要演进：① 命令清单大幅扩展，新增只读会话树 `get_entries`（带 `since`）/`get_tree`（v0.80.3，`rpc-types.ts:64-65`）与 `get_available_thinking_levels`（v0.81.0，`:39`），以及 `clone`/`switch_session`/`compact`/`set_auto_compaction`/`set_auto_retry`/`abort_retry`/`abort_bash`/`get_commands`/`cycle_thinking_level` 等；② 事件流新增流式 `bash_execution_update`（v0.82.0）与 `summarization_retry_*`（v0.81.1，`agent-session.ts:167-181`）；③ `./rpc-entry` 包导出直接以 RPC 模式启动进程（v0.80.3）；④ `prompt` 改为单一权威响应 + preflight 契约（v0.67.3），未知命令错误响应带 `id`（v0.79.7）；⑤ 从包根导出 typed `RpcClient`（v0.67.67），子进程退出时 reject pending 请求（v0.76.0）；⑥ `bash` 透传 `excludeFromContext`（v0.76.0）；⑦ 严格 LF framing（不可用 Node `readline`）+ stdout 背压处理。
+> 若要把 pi 当库**嵌入**同一进程（而非 spawn 子进程驱动），见第 26b 章 SDK。

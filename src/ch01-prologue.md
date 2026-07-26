@@ -102,7 +102,7 @@ graph TB
 
 最内层解决一个纯粹的问题：如何用统一的接口调用不同的 LLM provider。
 
-**Provider Registry** 是一个极简的注册表（`api-registry.ts` 只有 98 行），支持 Anthropic、OpenAI、Google、Bedrock、Mistral 等。注册一个新 provider 至少要提供 `api` 标识、`stream` 和 `streamSimple` 这组接口面，然后把它们挂到注册表里。
+**Provider 集合** 是一个极简的统一调用面：`models.ts` 里的 `Models` 把一批 `Provider` 显式组装成一个集合，支持 Anthropic、OpenAI、Google、Bedrock、Mistral 等。定义一个新 provider 至少要提供 `api` 标识、`stream` 这组接口面，然后把它加进集合。（早期这里是一个全局的 `api-registry.ts` 注册表，v0.80.0 后被显式的 `Models` 集合取代，详见第 4 章。）
 
 **事件流** 是 pi-ai 的核心输出格式。无论哪个 provider，调用结果都被标准化为一系列事件：`text-delta`、`tool-call-delta`、`usage` 等。下游代码完全不需要知道底层 provider 的 API 格式。
 
@@ -148,7 +148,7 @@ pi 的定位更接近运行时：
 
 **没有强制的项目结构**。pi 不要求你的项目遵循特定的目录布局或配置格式。Extension 是一个 TypeScript 文件，导出一个工厂函数 — 就这些。没有 decorator、没有 annotation、没有继承链。
 
-**不隐藏底层**。pi-ai 层提供了统一的 provider 抽象，但如果你需要直接访问底层 provider 的原始 API（比如 Anthropic 的 prompt caching），可以直接导入 `@mariozechner/pi-ai/anthropic` 使用 provider 特定的功能。抽象是可穿透的。
+**不隐藏底层**。pi-ai 层提供了统一的 provider 抽象，但如果你需要直接访问底层 provider 的原始 API（比如 Anthropic 的 prompt caching），可以直接导入 `@earendil-works/pi-ai/anthropic` 使用 provider 特定的功能。抽象是可穿透的。
 
 这不是说 "运行时" 比 "框架" 更好。框架的优势是**降低入门门槛** — 开发者不需要理解完整的系统就能开始使用。pi 的运行时定位意味着开发者需要更多的理解成本，换来的是更多的控制权。
 
@@ -188,4 +188,6 @@ pi 的定位更接近运行时：
 ---
 
 ### 版本演化说明
-> 本书核心分析基于 pi-mono v0.66.0（2026 年 4 月）。
+> 本书核心分析基于 pi-mono v0.66.0（2026 年 4 月），并已对照 v0.82.1（2026 年 7 月）核实。
+> 本章的洋葱四层模型在此期间保持不变；仓库结构层面的变化（包数量的收缩与再扩张、新增
+> server / sqlite-node / evals 三个包）见第 2 章。

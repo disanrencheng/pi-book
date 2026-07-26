@@ -353,7 +353,7 @@ export type AgentMessage =
 
 ```typescript
 // 在 pi-coding-agent 中
-declare module "@mariozechner/agent" {
+declare module "@earendil-works/pi-agent-core" {
   interface CustomAgentMessages {
     custom: CustomMessage;        // compaction 摘要、分支标记等
     bashExecution: BashMessage;   // bash 工具的结构化结果
@@ -396,6 +396,90 @@ type AgentMessage =
 
 这张表揭示了一个设计原则：**Agent 只管运行时状态，不管配置和策略。** 它知道自己正在用什么模型（`state.model`），但不知道为什么选这个模型。它知道有哪些工具可用（`state.tools`），但不知道这些工具是怎么被发现和注册的。它知道 system prompt 是什么（`state.systemPrompt`），但不知道 prompt 是怎么从多个来源拼接出来的。
 
+## 另一条路：`AgentHarness` 这个"厚壳"
+
+上面那张表的每一行 —— 会话持久化、压缩、skills、工具来源 —— `Agent` 都明确委托给了上层（coding-agent 包）。但 packages/agent 在 v0.79 周期里长出了**第二条路径**：`AgentHarness`（`packages/agent/src/harness/agent-harness.ts:174`），它把那张表里委托出去的东西**反过来收编回了 agent 包内部**。
+
+如果说 `Agent` 是"薄壳 + 上层自己拼装一切"，`AgentHarness` 就是一个"自带电池"的厚壳：
+
+| 表里委托出去的 | `AgentHarness` 的内聚实现 |
+|---|---|
+| 会话持久化（SessionManager） | 两层拆分：底层 `SessionStorage`（条目/树持久化，`harness/types.ts:498`）+ 上层 `SessionRepo`（会话集合生命周期，`:528`）；实现 `JsonlSessionStorage` / `InMemorySessionStorage`、`JsonlSessionRepo` / `InMemorySessionRepo`（`harness/session/`）、session tree、`fork()`、`navigateTree()` |
+| Context 压缩（Compaction） | 内置 `compact()` / `prepareCompaction` + 分支摘要（`harness/compaction/`），可配 `retry?: RetryPolicy` 与 retry_* 事件 |
+| Skills / Prompt 模板 | `skill(name)` / `promptFromTemplate(name, args)`（`harness/skills.ts`、`prompt-templates.ts`） |
+| 工具来源（Extension） | `getTools`/`setTools` 与 `getActiveTools`/`setActiveTools` 二层模型 + 重名校验；工具类型改为上下文感知的 `AgentHarnessTool<TContext>` |
+| 文件系统 / shell 触达 | `ExecutionEnv`（`FileSystem` + `Shell`，`harness/types.ts:373`）被包装为 `ExecutionToolContext`（`harness/tools/tool-context.ts:4`），喂给内置工具 `harness/tools/{read,write,edit,bash}.ts`；Node 实现见 `harness/env/nodejs.ts` |
+
+它还提供了比 `Agent.subscribe()` 更丰富的**类型化钩子链** `on(type, handler)`（`agent-harness.ts:1050`）—— `before_provider_request`、`after_provider_response`、`tool_call`/`tool_result`、`session_before_compact` / `session_compact`、`session_before_tree` / `session_tree` 等 —— 以及一套 `Result<T, E>` 风格的错误模型（`AgentHarnessError` 归一化 `SessionError`/`CompactionError`/`BranchSummaryError`，`agent-harness.ts:145-151`）和显式的运行阶段机 `AgentHarnessPhase = "idle" | "turn" | "compaction" | "branch_summary" | "retry"`（`types.ts:553`），用 `phase !== "idle"` 守卫拒绝重入。
+
+```mermaid
+flowchart LR
+    subgraph thin["薄壳路径（生产在用）"]
+        Agent["Agent\n只管运行时状态"]
+        Upper["coding-agent 上层\nSessionManager/Compaction/\nExtension/Skills"]
+        Agent -.委托.-> Upper
+    end
+    subgraph thick["厚壳路径（演进中）"]
+        Harness["AgentHarness\n自带会话/压缩/skills/ExecutionEnv"]
+    end
+    Loop["agentLoop\n（同一个无状态引擎）"]
+    Agent --> Loop
+    Harness --> Loop
+```
+
+厚壳在 v0.79 之后又经历了几次实质重构，值得单独展开三处，因为它们恰好都是"把厚度收回内核"这个选择必须付的账。
+
+### 工具模型：从上下文无关的 `AgentTool` 到 `AgentHarnessTool<TContext>`
+
+薄壳路径里，工具是**上下文无关**的 —— `AgentTool.execute(id, args, signal, onUpdate)` 拿不到任何应用级依赖，要触达文件系统或 shell 得靠闭包捕获。v0.82.0 的 breaking 重构给厚壳换了一套工具类型 `AgentHarnessTool<TContext>`（`harness/types.ts:99-112`），它在 `AgentTool` 的 `execute` 末尾**多加了一个 `context: TContext` 参数**：
+
+```typescript
+// packages/agent/src/harness/types.ts:99-112（简化）
+export type AgentHarnessTool<TContext extends object | undefined, ...> =
+  Omit<AgentTool<...>, "execute"> & {
+    execute(
+      toolCallId: string,
+      params: Static<TParameters>,
+      signal: AbortSignal | undefined,
+      onUpdate: AgentToolUpdateCallback<TDetails> | undefined,
+      context: TContext,          // ← 每个 turn 快照解析出的应用自定义 context
+    ): Promise<AgentToolResult<TDetails>>;
+  };
+```
+
+这个 `context` 从哪来？厚壳的构造选项里多了一个 `toolContext`（`harness/types.ts:955`）：应用要么给一个静态值，要么给一个零参 provider，由 harness **在每个 turn 的快照时刻解析一次**，再注入当轮所有工具的 `execute`。类型上还做了纪律约束 —— 当 `TContext` 为 `undefined`（上下文无关的 harness）时 `toolContext?: undefined`，一旦声明了非空 `TContext`，`toolContext` 就变成**必填**（`harness/types.ts:942-956`）。
+
+那原来那套 `ExecutionEnv`（`FileSystem` + `Shell`）去哪了？它**没有被删**（`harness/types.ts:373` 仍在），而是被**降级成一种具体的 context 形态**：内置工具需要的文件/ shell 触达被收进 `ExecutionToolContext`（`harness/tools/tool-context.ts:4`），其定义就是薄薄一层 `{ env: ExecutionEnv }`。厚壳自带的上下文感知工具 `harness/tools/{read,write,edit,bash}.ts` 正是以这个 `ExecutionToolContext` 为 `TContext`，通过 `execute(..., context)` 的最后一个参数拿到 `env` 去读写磁盘、跑命令。
+
+**这个改动的取舍**：得到的是**工具依赖显式化** —— 工具不再靠闭包偷偷捕获环境，而是由 harness 在 turn 边界统一注入、可随快照替换（比如切换工作目录 / 沙箱）；付出的是**又一个 breaking 的类型分叉**，厚壳的工具从此和薄壳的 `AgentTool` 不是同一个类型，两条路径的工具不能直接互换。
+
+### 会话两层：`SessionStorage` 与 `SessionRepo`
+
+前面表里把会话持久化一句带过成"`SessionRepo` 抽象"。厚壳的会话其实是**两层**，把"一个会话内部怎么存"和"多个会话怎么管"拆开了。这个两层结构在 v0.80.x 就已成型（v0.80.4 起导出 `Jsonl` / `InMemory` 两套实现），v0.81.0 则重构了它的契约（新增 `getPathToRootOrCompaction`、cursor 式读取，以及 compaction checkpoint 语义）：
+
+- **`SessionStorage`**（`harness/types.ts:498`）是**单会话内的条目/树存储**：`appendEntry` / `getEntry` / 游标式 `getEntries`、`getLeafId` / `setLeafId` 追踪当前叶子、`getSessionName` / `getSessionStats`，以及关键的 `getPathToRootOrCompaction(leafId)`（`:512`）—— 从某个叶子回溯到根**或到最近一次 compaction 为止**，让压缩尾部成为一个自包含的 checkpoint，回放不必每次都拉到最开头。
+- **`SessionRepo`**（`harness/types.ts:528`）是**跨会话的集合生命周期**：`create` / `open` / `list` / `delete` / `fork`。`fork` 就落在这一层，配合 storage 的 tree 能力实现分支。
+
+两层各有内存与 JSONL 两套实现：`InMemorySessionStorage` / `JsonlSessionStorage`（v0.80.4 起导出）与 `InMemorySessionRepo` / `JsonlSessionRepo`；JSONL 侧的仓库接口收窄为 `JsonlSessionRepoApi`（`harness/types.ts:550`）。分层的意义在于：换存储介质只需替换 `SessionStorage`（比如未来接数据库），而 `SessionRepo` 的会话管理语义与 `fork` / 树导航逻辑不必跟着改。
+
+### 压缩重试：`RetryPolicy` 与三个 retry_* 事件
+
+前面提到厚壳的运行阶段机里有一个 `"retry"` 阶段（`types.ts:553`）。v0.81.1 把它补齐成了一套**可配置的重试策略 + 生命周期事件**：构造选项新增 `retry?: RetryPolicy`（`harness/types.ts:934`，类型来自 pi-ai），专门作用于**生成式的 compaction 与 branch-summary 请求**（这两步要额外调 LLM，是最容易踩到瞬时失败的地方）。重试过程通过三个事件对外可观测：
+
+- `retry_scheduled`（`harness/types.ts:666`）：带 `operation`（`"compaction"` | `"branch_summary"`）、`attempt` / `maxAttempts` / `delayMs` / `errorMessage`，宣告"第几次重试将在多久后开始、上次为何失败"。
+- `retry_attempt_start`（`:675`）：一次重试真正启动。
+- `retry_finished`（`:680`）：重试序列结束。
+
+它们和既有的 `"retry"` 阶段呼应 —— 阶段机用 `phase === "retry"` 守卫重入，事件流则让订阅者看到重试的节奏。这正是薄壳"不能自己重试"（第 8 章取舍）在厚壳里被收编的地方：`Agent` 把重试留给上层，`AgentHarness` 则把它做进了内核，代价是又多背了一份策略配置。要注意，这套 harness 内核里的 `RetryPolicy` / `retry_*` 与第 12 章 coding-agent 产品层的 `summarization_retry_*` 是**不同层的同构机制** —— 前者在 agent 内核重试生成式 compaction / branch-summary，后者在产品层重试会话摘要，二者互不依赖、各自成套。
+
+### 认证收敛：models-only
+
+薄壳 `Agent` 走 `getApiKey` 回调拿密钥（上面那张"Agent 不管什么"的表仍然成立，`agent.ts:102`）。但厚壳这一侧在 v0.80.0 做了 breaking 收敛：**移除了 `getApiKeyAndHeaders`**，认证统一收口到一个必填的 `models: Models`（`harness/types.ts:923`）—— turn 流式、compaction、branch-summary 全部经由 `Models` 集合，认证由各 provider 自己的 auth 解析。`compact()` / `generateSummary()` / `generateBranchSummary()` 也相应改收 `Models`。换句话说，厚壳不再有"裸密钥 + headers"这条老路，只认 provider 运行时对象。**这只影响 `AgentHarness` 一侧；`Agent` 路径的 `getApiKey` 叙述保持不变。**
+
+**必须如实说明它的采用状态**：截至 v0.82.1，**生产的 coding-agent 仍然用 `new Agent({...})`**（`packages/coding-agent/src/core/sdk.ts:294`），`AgentHarness` 目前只在 agent 包自身的测试与 `docs/{agent-harness,durable-harness,hooks}.md` 里使用，coding-agent 源码中没有任何 `AgentHarness` 引用。所以它是一个**演进中的并行抽象**，不是已经取代 `Agent` 的新默认。
+
+这两条路线本身就是本书主线的一次张力实验：`Agent` 把厚度留给上层、换取内核纯净；`AgentHarness` 把厚度收回内核、换取开箱即用的持久会话与分支能力。两者共享同一个 `agentLoop` 引擎 —— 厚薄之争发生在引擎之上，而引擎自己始终只管转。
+
 ## 取舍分析
 
 ### 得到了什么
@@ -417,7 +501,17 @@ type AgentMessage =
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。`Agent` 类的核心结构自引入以来保持稳定。
+> 本章核心分析基于 pi-mono v0.66.0，并已对照 v0.82.1。`Agent` 类的核心结构自引入
+> 以来保持稳定，仍是生产 coding-agent 的运行时壳（`coding-agent/src/core/sdk.ts:294`）。
 > `PendingMessageQueue` 的 `"all"` | `"one-at-a-time"` 模式是后来的增强，
 > 早期版本只有 `"one-at-a-time"` 行为。`CustomAgentMessages` 声明合并机制
-> 在 pi-agent-core 从 pi-coding-agent 分离时引入，解决了包间类型依赖问题。
+> 在 pi-agent-core 从 pi-coding-agent 分离时引入，解决了包间类型依赖问题
+> （模块名随 scope 迁移为 `@earendil-works/pi-agent-core`）。v0.79 周期新增的
+> `AgentHarness` 子系统（`packages/agent/src/harness/`）把会话/压缩/skills/ExecutionEnv
+> 内聚进 agent 包，是与 `Agent` 并存的"厚壳"路径，目前仍仅在 agent 包自身测试/docs 中使用。
+> 该厚壳在 v0.79 之后持续重构：v0.80.0 认证收敛为 models-only（移除 `getApiKeyAndHeaders`，
+> `models: Models` 必填）；v0.81.0 会话拆成 `SessionStorage` + `SessionRepo` 两层
+> （新增 `getPathToRootOrCompaction`）；v0.81.1 为 compaction / branch-summary 补上
+> `retry?: RetryPolicy` 与 `retry_scheduled` / `retry_attempt_start` / `retry_finished` 事件；
+> v0.82.0 工具模型 breaking 重构为上下文感知的 `AgentHarnessTool<TContext>` + `toolContext`，
+> `ExecutionEnv` 被包装为 `ExecutionToolContext` 喂给内置的 read/write/edit/bash 工具。

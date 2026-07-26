@@ -155,24 +155,36 @@ const defaultReadOperations: ReadOperations = {
 
 ## TUI 中的渲染：语法高亮与折叠
 
-read 结果在 TUI 中的展示也经过了精心设计。`formatReadResult` 函数会：
+read 结果在 TUI 中的展示也经过了精心设计。对于**普通代码/文本文件**，`formatReadResult` 函数会：
 
 1. 根据文件扩展名检测语言（`getLanguageFromPath`）
 2. 对代码内容做语法高亮（`highlightCode`）
-3. 默认只显示前 10 行，更多内容需要用户手动展开
+3. 默认只显示前若干行（折叠预览），更多内容需要用户手动展开
 4. 截断信息用 warning 色显示，提示 LLM 输出被限制了
 
+但有一类文件走**更激进的折叠**：当未展开（`!context.expanded`）时，read 会先用 `getCompactReadClassification` 判断这是不是一个"资源型文件"——`SKILL.md`、pi 自身的文档、以及 `AGENTS.md`/`CLAUDE.md`（含全大写 `AGENTS.MD`/`CLAUDE.MD`，见 `COMPACT_RESOURCE_FILE_NAMES`，read.ts:37）。如果是，结果**折叠为单独一行**（如 `[skill] tdd (Ctrl+O to expand)` 或一行资源路径 + 选中的行范围），而不是前 10 行预览：
+
 ```typescript
-// packages/coding-agent/src/core/tools/read.ts:93-98
-const maxLines = options.expanded ? lines.length : 10;
-const displayLines = lines.slice(0, maxLines);
-const remaining = lines.length - maxLines;
-if (remaining > 0) {
-  text += `... (${remaining} more lines, press key to expand)`;
+// packages/coding-agent/src/core/tools/read.ts:117-138（节选）
+function getCompactReadClassification(args, cwd): CompactReadClassification | undefined {
+  const fileName = basename(resolveToCwd(rawPath, cwd));
+  if (fileName === "SKILL.md") return { kind: "skill", label: ... };
+  const docs = getPiDocsClassification(absolutePath);
+  if (docs) return docs;
+  if (COMPACT_RESOURCE_FILE_NAMES.has(fileName))   // AGENTS.md / CLAUDE.md / 大写变体
+    return { kind: "resource", label: ... };
+  return undefined;
 }
+// 渲染时（read.ts:342）：!context.expanded 时才套用紧凑分类
 ```
 
-这里有一个微妙的分层：LLM 看到的是完整的截断后内容（最多 2000 行/50KB），但用户在 TUI 中看到的默认只有 10 行。两个截断分别服务不同的受众 — LLM 需要足够的上下文做决策，用户只需要确认 read 读对了文件。
+为什么这些文件要折叠成一行？因为 agent 在一个会话里会**反复读取**它们（每次涉及项目规则、skill 内容时都可能 read 一遍），如果每次都在 TUI 里铺开 10 行预览，屏幕会被这些"基础设施文件"刷屏。折叠成一行 + `Ctrl+O` 展开，既不打扰用户，又保留按需查看的能力。
+
+> **订正（v0.73.0 / v0.75.5）**：早期版本对所有文件一视同仁地"只显示前 10 行"。现在对 `AGENTS.md`/`CLAUDE.md`/`SKILL.md`/pi 文档等资源型文件改为**折叠为单行**（可 `Ctrl+O` 展开），普通文件仍是前若干行预览。
+
+这里有一个微妙的分层：LLM 看到的是完整的截断后内容（最多 2000 行/50KB），但用户在 TUI 中看到的是折叠预览（普通文件前若干行、资源型文件单行）。两个折叠分别服务不同的受众 — LLM 需要足够的上下文做决策，用户只需要确认 read 读对了文件。
+
+> **边界修正（v0.81.0，#6731）**：`formatReadResult` 现在多接一个 `isError` 参数（`read.ts:171`）。read **失败**时的输出（如"文件不存在"）本身不是文件内容，早期却被和成功结果一样按文件扩展名做**语法高亮**，读起来像是把错误信息误当成了代码。修复后，`isError` 为真时既不套紧凑折叠、也不做语法高亮（`!isError && … getLanguageFromPath(...)`，`read.ts:179-180`）—— 错误信息以朴素文本呈现，不再伪装成高亮代码。
 
 ## 取舍分析
 
@@ -193,6 +205,6 @@ if (remaining > 0) {
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0。Read 工具支持文本文件读取（带截断保护）
-> 和图片读取（自动检测图片格式并返回 base64 编码）。
-> `ReadOperations` 的 pluggable 设计在图片支持添加时一同引入。
+> 本章核心分析基于 pi-mono v0.66.0，已对照 **v0.82.1**。Read 工具支持文本（带双重截断保护）和图片（自动检测格式 + base64 + 自动 resize）。
+> 主要设计级变化：① read **错误输出不再被当文件内容语法高亮**（v0.81.0，#6731，`formatReadResult` 加 `isError` 参数，`read.ts:171,179`）；② v0.73.0/v0.75.5 引入 `getCompactReadClassification` —— `AGENTS.md`/`CLAUDE.md`（含大写）/`SKILL.md`/pi 文档在未展开时折叠为单行（`Ctrl+O` 展开），不再统一"只显示前 10 行"；③ BMP 检测转 PNG（v0.80.3）。
+> `ReadOperations` 的 pluggable 设计与图片支持保持不变；图片 resize 与 fs 读取在流式期间移入 worker（v0.76.0）。
