@@ -159,6 +159,8 @@ export function applyEditsToNormalizedContent(
 
 从后往前替换是关键技巧 — 替换后面的文本不会改变前面文本的偏移量，所以所有 edit 可以安全地使用它们在原始内容中匹配到的位置。
 
+> **边界修正（v0.79.9，#5899）**：当走**模糊匹配**时，替换只作用在匹配到的那一段行块上，**原文其余未改动的行块被原样保留**（`edit-diff.ts:123` 的"preserving unchanged line blocks from the original"）。早期实现会把整个文件先归一化再重写，结果是即使只改一行，未匹配区域的行尾/smart quotes 等也可能被归一化"顺手"改掉；修复后模糊匹配不再整文件重写，只动它真正命中的块。
+
 `generateDiffString` 生成带行号的 unified diff，返回给 LLM 作为 tool result。它还返回 `firstChangedLine` — 用于 TUI 中自动跳转到修改位置：
 
 ```typescript
@@ -375,5 +377,5 @@ const defaultEditOperations: EditOperations = {
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0，已校订至 v0.79.7。Edit 从"行号编辑"演变为"精确替换"是重要的设计转变；`prepareArguments`（第 9 章）兼容旧版 API，`edits[]` 多编辑、fuzzy matching、行尾归一化、file-mutation-queue 均保持。
-> 主要演进：① `prepareArguments` 增加对 `edits` 为 JSON 字符串的容错（Opus 4.6/GLM-5.1 等模型，先 JSON.parse）；② 结果附带标准 unified patch，`generateDiffString`/`generateUnifiedPatch`/`EditDiffResult` 自 v0.79.7 起作为公共 API 导出。
+> 本章核心分析基于 pi-mono v0.66.0，已对照 **v0.82.1**。Edit 从"行号编辑"演变为"精确替换"是重要的设计转变；`prepareArguments`（第 9 章）兼容旧版 API，`edits[]` 多编辑、fuzzy matching、行尾归一化、file-mutation-queue 均保持。
+> 主要演进：① 模糊匹配保留未改动行块、不再整文件重写（v0.79.9，#5899）；② `prepareArguments` 增加对 `edits` 为 JSON 字符串的容错（Opus 4.6/GLM-5.1 等模型，先 JSON.parse）、schema 允许模型多发的替换字段（v0.80.4）；③ 结果附带标准 unified patch，`generateDiffString`/`generateUnifiedPatch`/`EditDiffResult` 自 v0.79.7 起作为公共 API 导出。

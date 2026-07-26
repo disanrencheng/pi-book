@@ -543,6 +543,22 @@ LLM 知道之前试过策略模式（通过 branch summary），但上下文中�
 
 `/tree` 是零拷贝的同文件分支，`/fork` 和 `/clone` 则产生新文件 —— 这正是上一节"提取单条路径到新文件"的两种入口。定位会话还多了两个自动化友好的入口：`--session-id <id>`（精确创建/恢复某个项目会话，args.ts:108）与 `PI_CODING_AGENT_SESSION_DIR` 环境变量（覆盖会话存储目录，args.ts:375）。
 
+## RPC 只读会话树访问：`get_entries` / `get_tree`
+
+前面讲的树结构（entry 列表、`SessionTreeNode`）此前只有 pi 自己的 TUI 能看到。v0.80.3 起，RPC 模式把它作为**只读**能力暴露出来，让 IDE 插件、Web 前端这类外部宿主也能渲染会话树：
+
+```typescript
+// packages/coding-agent/src/modes/rpc/rpc-types.ts:64-65
+| { id?: string; type: "get_entries"; since?: string }
+| { id?: string; type: "get_tree" }
+```
+
+两个命令各有分工：`get_tree` 返回完整的 `SessionTreeNode[]`（就是本章 `getTree()` 构建的那棵树，带 label），适合一次性画出整棵分支图；`get_entries` 返回扁平的 entry 列表，且带一个 `since` 参数 —— 只要上次拿到的最后一个 entry id，就能**增量**拉取此后追加的 entry，而不必每次全量传输整棵树。对一个正在流式追加消息的长会话，`since` 让客户端的树视图能低成本地跟着更新。
+
+这两个命令都是**只读**的 —— 它们只读 `SessionManager` 已经加载的树，不触发任何写操作，呼应本章"append-only + 防御性浅拷贝"的设计。相关地，会话选择器（`/resume` 列表）现在**按子树的最近活动时间排序**，让最近动过的会话/分支浮到前面。
+
+存储层本身也更可插拔了：`JsonlSessionStorage` / `InMemorySessionStorage` 作为公共导出（第 26b 章 SDK），宿主可以自带存储后端；JSONL 会话头（`SessionHeader`）也支持自定义 metadata，让上层在会话文件里挂自己的元信息。
+
 ## 取舍分析
 
 ### 得到了什么
@@ -580,6 +596,6 @@ LLM 知道之前试过策略模式（通过 branch summary），但上下文中�
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0，已校订至 v0.79.7。9 种 entry、v1→v2→v3 迁移、parentId 树形零拷贝分支均不变。
-> 主要演进：① 会话 id 改用 UUIDv7（v0.67.1，时间有序，利于按 id 路由 + prompt 缓存）；② 命令三件套 `/tree`（同文件原地分支）、`/fork`（开新文件，支持 `position: before|at`）、`/clone`（复制当前分支到新文件）；③ `--session-id` 精确定位（v0.76.0）、`PI_CODING_AGENT_SESSION_DIR`（v0.71.0）；④ `/resume` 改为逐行流式读 JSONL（v0.78.1，防 OOM）。
+> 本章核心分析基于 pi-mono v0.66.0，已对照 **v0.82.1**。9 种 entry、v1→v2→v3 迁移、parentId 树形零拷贝分支均不变。
+> 主要演进：① RPC 新增只读会话树访问 `get_entries`（带 `since` 增量）/`get_tree`（v0.80.3，`rpc-types.ts:64-65`，见第 26 章），会话选择器按子树最近活动排序；② 可插拔存储 `JsonlSessionStorage`/`InMemorySessionStorage` 导出、JSONL 会话头自定义 metadata（v0.80.4）；③ 会话 id 改用 UUIDv7（v0.67.1，时间有序，利于按 id 路由 + prompt 缓存）；④ 命令三件套 `/tree`（同文件原地分支）、`/fork`（开新文件，支持 `position: before|at`）、`/clone`（复制当前分支到新文件）；⑤ `--session-id` 精确定位（v0.76.0）、`PI_CODING_AGENT_SESSION_DIR`（v0.71.0）；⑥ `/resume` 改为逐行流式读 JSONL（v0.78.1，防 OOM）。
 > `CustomEntry`、`CustomMessageEntry`、`LabelEntry`、`SessionInfoEntry` 为 extension 生态和用户体验提供扩展点；旧版 session 通过 `migrateV1ToV2`/`migrateV2ToV3` 自动升级。

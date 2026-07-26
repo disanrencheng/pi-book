@@ -10,15 +10,15 @@
 
 # 第一篇：分层的纪律
 
-- [四个包不是四个项目](./ch02-packages.md)
+- [包不是项目](./ch02-packages.md)
 - [怎样高效阅读这个仓库](./ch03-reading-map.md)
 
 # 第二篇：统一调用面 — pi-ai 的设计
 
 - [Provider 不是 Adapter](./ch04-provider-registry.md)
-- [消息变换：跨模型交接的隐藏复杂度](./ch05-message-transform.md)
+- [消息变换 — 跨模型交接的隐藏复杂度](./ch05-message-transform.md)
 - [统一事件流设计](./ch06-event-stream.md)
-- [OAuth — 统一认证的隐藏复杂度](./ch07-oauth.md)
+- [认证是一等子系统](./ch07-oauth.md)
 
 # 第三篇：Agent Runtime — 循环引擎的设计
 
@@ -28,7 +28,7 @@
 
 # 第四篇：从 Runtime 到产品
 
-- [会话树：比"聊天记录"更好的数据模型](./ch11-session-tree.md)
+- [会话树 — 比"聊天记录"更好的数据模型](./ch11-session-tree.md)
 - [Compaction — 把无限对话装进有限窗口](./ch12-compaction.md)
 - [三级配置覆盖](./ch13-config-layers.md)
 - [System Prompt 是一套装配流程](./ch14-system-prompt.md)
@@ -42,7 +42,7 @@
 
 # 第六篇：工具设计 — 约束即保护
 
-- [工具设计原则](./ch19-tool-principles.md)
+- [工具设计原则 — 约束即保护](./ch19-tool-principles.md)
 - [edit 的设计 — 为什么不能直接写文件](./ch20-edit-tool.md)
 - [read 的设计 — 为什么不是简单的 cat](./ch21-read-tool.md)
 - [bash 与外部世界的边界](./ch22-bash-tool.md)

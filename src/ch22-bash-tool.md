@@ -217,6 +217,42 @@ recordBashResult(command, result, options): void {
 
 另外两点与上下文相关的细节：bash 的输出从 v0.73.0 起**增量地进入模型上下文**（流式 chunk 边产生边累积，而非命令结束才一次性塞入），进程退出后还会继续 drain stdout/stderr 以免丢尾部输出；`shellPath` 与工作目录都跟随**会话当前 cwd**（`sessionManager.getCwd()`，agent-session.ts:2610），而非 pi 启动时的目录 —— 又一次"去 process-global"。
 
+## 会话环境变量：把会话身份注入子进程（v0.82.0）
+
+bash 执行的命令常常需要知道"我正跑在哪个会话里、用的什么模型"。v0.82.0 起，pi 在 spawn 子进程前会往它的环境里注入一组 **`PI_*` 会话变量**：
+
+```typescript
+// packages/coding-agent/src/core/tools/bash.ts:166-180（节选）
+const env = { ...getShellEnv() };
+delete env.PI_SESSION_ID;   // 先清掉继承来的旧值，避免串味
+delete env.PI_SESSION_FILE;
+delete env.PI_PROVIDER;
+delete env.PI_MODEL;
+delete env.PI_REASONING_LEVEL;
+if (exposeSessionEnvironment && ctx) {
+  env.PI_SESSION_ID = ctx.sessionManager.getSessionId();
+  const sessionFile = ctx.sessionManager.getSessionFile();
+  if (sessionFile) env.PI_SESSION_FILE = sessionFile;
+  if (ctx.model) {
+    env.PI_PROVIDER = ctx.model.provider;
+    env.PI_MODEL = ctx.model.id;
+  }
+  if (ctx.thinkingLevel) env.PI_REASONING_LEVEL = ctx.thinkingLevel;
+}
+```
+
+五个变量各自对应一维会话身份：
+
+- **`PI_SESSION_ID`** —— 当前会话 id（第 11 章的 UUIDv7）
+- **`PI_SESSION_FILE`** —— 会话 JSONL 文件的绝对路径（若会话落盘）
+- **`PI_PROVIDER`** —— 当前模型的 provider（如 `anthropic`）
+- **`PI_MODEL`** —— 当前模型 id（如 `claude-opus-4-6`）
+- **`PI_REASONING_LEVEL`** —— 当前 thinking 档位（如 `medium`）
+
+有两个设计细节值得注意。其一，注入前**先 `delete` 一遍**：pi 自己可能就跑在一个带 `PI_*` 的环境里（比如嵌套调用），不清掉旧值，子进程会读到上一层的会话身份。其二，注入受 `exposeSessionEnvironment` 开关控制 —— 它默认开启，但宿主可以关掉，因为把会话文件路径暴露给任意 LLM 执行的命令并非所有场景都想要。
+
+一个真实用例是第 26b 章的 **evals harness**：它用 `PI_PROVIDER` / `PI_MODEL` 从环境里读出要评测的模型（`getRequiredModelSelection()`），再装配 session。也就是说，这组会话变量不只是给用户脚本看的 —— 它已经是 pi 自己评测管线的输入。配套地，直连 RPC 的 bash 执行会通过流式 `bash_execution_update` 事件把输出增量吐给客户端（见第 26 章）。
+
 ## 取舍分析
 
 ### 得到了什么
@@ -234,9 +270,10 @@ recordBashResult(command, result, options): void {
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0，已校订至 v0.79.7。Bash 工具的输出处理经历多次改进 —
+> 本章核心分析基于 pi-mono v0.66.0，已对照 **v0.82.1**。Bash 工具的输出处理经历多次改进 —
 > 输出 tail 截断、`BashSpawnHook`、`fullOutputPath` 临时文件机制均保持。
-> 主要设计级变化：① `excludeFromContext`（`!!` 前缀，v0.76.0）—— 命令执行并显示但输出不入 LLM 上下文；
-> ② 输出从 v0.73.0 起增量进入上下文，进程退出后继续 drain（v0.79.4）；
-> ③ `shellPath`/cwd 跟随会话当前 cwd 而非启动 cwd（v0.68.0）。
+> 主要设计级变化：① 会话环境变量 `PI_SESSION_ID`/`PI_SESSION_FILE`/`PI_PROVIDER`/`PI_MODEL`/`PI_REASONING_LEVEL` 注入子进程（v0.82.0，`bash.ts:166-180`，evals harness 依赖 `PI_PROVIDER`/`PI_MODEL`），直连 RPC bash 流式 `bash_execution_update`（第 26 章）；
+> ② `excludeFromContext`（`!!` 前缀，v0.76.0）—— 命令执行并显示但输出不入 LLM 上下文；
+> ③ 输出从 v0.73.0 起增量进入上下文，进程退出后继续 drain（v0.79.4）；
+> ④ `shellPath`/cwd 跟随会话当前 cwd 而非启动 cwd（v0.68.0）。
 > 此外 system prompt 不再硬性指引"有专用工具时勿用 bash"（v0.77.0，详见第 14 章）。

@@ -89,7 +89,7 @@ flowchart TB
 让我们看看实际代码。为了聚焦设计，这里展示 `runLoop()` 的核心结构（简化版，省略了 `turn_start`/`turn_end` 事件发射和 `firstTurn` 首轮保护逻辑，完整版见源码）：
 
 ```typescript
-// packages/agent/src/agent-loop.ts:166-260（简化）
+// packages/agent/src/agent-loop.ts:155-320（简化）
 
 async function runLoop(
   currentContext: AgentContext,
@@ -97,7 +97,7 @@ async function runLoop(
   config: AgentLoopConfig,
   signal: AbortSignal | undefined,
   emit: AgentEventSink,
-  streamFn?: StreamFn,
+  streamFunction: StreamFn,   // ← 必填：底层循环不自带兜底（agent-loop.ts:161）
 ): Promise<void> {
   let pendingMessages: AgentMessage[] =
     (await config.getSteeringMessages?.()) || [];
@@ -122,7 +122,7 @@ async function runLoop(
 
       // 2. 调用 LLM，获取 assistant 响应
       const message = await streamAssistantResponse(
-        currentContext, config, signal, emit, streamFn
+        currentContext, config, signal, emit, streamFunction
       );
       newMessages.push(message);
 
@@ -203,12 +203,32 @@ async function runLoop(
 - `prepareNextTurn(ctx)`（v0.72.0）：返回一个 `AgentLoopTurnUpdate`，可在 turn 之间**热切换** `context` / `model` / `thinkingLevel`。返回 `undefined` 则沿用当前配置。这让"先用便宜模型探路、命中难点再升档"这类策略可以在**同一次循环运行内**完成，而不必结束循环重启。
 - `shouldStopAfterTurn(ctx)`（v0.72.0）：返回 `true` 则在本 turn 后优雅退出（emit `agent_end`），且发生在 steering / follow-up 轮询之前。它与 `terminate` 的区别是控制权归属：`terminate` 由工具发出，`shouldStopAfterTurn` 由调用者（上层）发出。
 
+**`prepareNextTurn` 的两个变体（v0.80.3）**。在循环配置这一层，`prepareNextTurn` 只有一个签名 —— `prepareNextTurn(context: PrepareNextTurnContext)`（`types.ts:224`）。但运行时壳 `Agent`（第 10 章）在它之上暴露了**两个**可选变体，让上层按需要选择回调拿到多少信息：
+
+- `prepareNextTurn(signal)`（`agent.ts:107`）：只关心"该不该换配置"，不需要 loop context 的轻量变体，只收到一个 abort `signal`。
+- `prepareNextTurnWithContext(context, signal)`（`agent.ts:110`）：既要 loop context（消息、上一条 assistant 响应、工具结果等），又要 abort `signal` 的完整变体。
+
+两者同时提供时**优先调用带 context 的变体**：`Agent.createLoopConfig()` 把它们折叠成循环需要的单个 `prepareNextTurn(context)`，内部先看 `prepareNextTurnWithContext` 在不在，在就调它、否则退回 `prepareNextTurn`（`agent.ts:448-454`）：
+
+```typescript
+// packages/agent/src/agent.ts:448-454（简化）
+prepareNextTurn: this.prepareNextTurnWithContext || this.prepareNextTurn
+  ? async (context) => {
+      if (this.prepareNextTurnWithContext)
+        return await this.prepareNextTurnWithContext(context, this.signal);
+      return await this.prepareNextTurn?.(this.signal);
+    }
+  : undefined,
+```
+
+注意这里把 `this.signal` 一路带了进去 —— **abort signal 现在会下发到 turn 间回调**。这让"turn 间热切换"的决策逻辑也能感知中止：如果这次 run 已经被 abort，回调可以据此跳过昂贵的 model 切换或 context 重算，而不是等切换做完才发现白做。
+
 ## 消息变换管道：只在 LLM 边界发生
 
 `runLoop()` 把"调 LLM"委托给了 `streamAssistantResponse()`。这个函数做了一件非常重要的事：**把 AgentMessage 世界和 LLM Message 世界桥接起来**。
 
 ```typescript
-// packages/agent/src/agent-loop.ts:238-271（简化，完整的流式
+// packages/agent/src/agent-loop.ts:286-320（简化，完整的流式
 // 事件处理约 90 行，这里只展示管道结构）
 
 async function streamAssistantResponse(
@@ -216,7 +236,7 @@ async function streamAssistantResponse(
   config: AgentLoopConfig,
   signal: AbortSignal | undefined,
   emit: AgentEventSink,
-  streamFn?: StreamFn,
+  streamFunction: StreamFn,
 ): Promise<AssistantMessage> {
   // 第一步：AgentMessage[] → AgentMessage[]（可选裁剪）
   let messages = context.messages;
@@ -275,6 +295,47 @@ Message[] → LLM
 循环内部全程使用 `AgentMessage`。工具执行返回的是 `ToolResultMessage`（AgentMessage 的一种），用户的 steering 消息也是 `AgentMessage`。转换只在调用 LLM 的那一刻发生。
 
 这意味着循环内部可以处理任意的自定义消息类型，而不需要关心 LLM 是否认识它们。自定义消息在循环内部是一等公民，只在出门见 LLM 时才被过滤。
+
+## stream 函数从哪来：底层必填，入口兜底
+
+`streamAssistantResponse` 最后调用的那个 `streamFunction`，是循环引擎与 LLM 之间**唯一**的耦合点 —— 循环不 import 任何 provider，它只持有一个"给我 context、还我事件流"的函数。这个函数到底从哪来，是本章主线（"循环引擎不依赖 provider 目录"）落到实处的地方，也是 v0.81 周期里一次值得记录的取舍反复。
+
+先看现在的分层。底层的 `runLoop` 把 `streamFunction: StreamFn` 列为**必填**参数（`agent-loop.ts:161`）—— 底层循环不为缺失的 stream 函数兜底，谁调用它谁就得把这个函数备齐。而面向使用者的公共入口 `agentLoop` / `runAgentLoop` 则把这个参数放宽为可选，并在转交给 `runLoop` 之前做一次兜底（`agent-loop.ts:116`、`:141`）：
+
+```typescript
+// packages/agent/src/agent-loop.ts:116（公共入口的兜底）
+await runLoop(
+  currentContext, newMessages, config, signal, emit,
+  streamFn ?? getDefaultStreamFn(),   // ← 调用者没给就取宿主默认
+);
+```
+
+`getDefaultStreamFn()` 来自一个全新的、只有二十行的模块 `stream-fn.ts`。它维护一个进程级的默认 stream 函数，由宿主通过 `setDefaultStreamFn()` 注入；没注入就取用时抛错，明确要求"要么显式传 `streamFn`，要么先 `setDefaultStreamFn()`"：
+
+```typescript
+// packages/agent/src/stream-fn.ts（节选）
+let defaultStreamFn: StreamFn | undefined;
+
+export function setDefaultStreamFn(fn: StreamFn | undefined): void {
+  defaultStreamFn = fn;
+}
+export function getDefaultStreamFn(): StreamFn {
+  if (!defaultStreamFn)
+    throw new Error("No default stream function configured. ...");
+  return defaultStreamFn;
+}
+```
+
+关键在于这套注入机制**不让 agent 包 import provider 目录**。宿主（比如 coding-agent）在启动时把自己那套模型运行时的 stream 函数装进来，agent 包始终只认 `StreamFn` 这个类型，不认某个具体的 provider catalog 或 compat 层。
+
+这套设计不是一步到位的，而是一次**取舍演进**，正好印证了主线：
+
+- **v0.81.0**：把底层 `runLoop` 的 `streamFn` 从可选改为**必填的 `streamFunction`**，同时删掉了循环内对 pi-ai/compat 层的隐式依赖。动机很纯粹 —— 循环引擎不该"偷偷"知道有个默认 provider 可用；要用哪套 stream，必须由调用方显式交出。代价是所有直接调用底层循环的路径（包括老的已编译消费者）都必须自带 stream 函数，否则直接失败。
+- **v0.81.1**：很快补回了一层**宿主可配置的 fallback**（`setDefaultStreamFn`/`getDefaultStreamFn`），但把它放在**公共入口**而非底层循环里。这样既保留了"底层必填、不依赖 provider 目录"的纪律，又让宿主能在应用边界注入一次默认值，免得每个调用点都手动传 `streamFn`。
+
+这一改一补的净结果是：**依赖倒置的方向被彻底摆正**。底层循环对 stream 函数是"必填、无兜底"，把 provider 的存在性完全推给调用方；宿主级的默认注入则被限制在入口层，成为一个可选的便利，而不是循环的内在假设。这正是"循环引擎不依赖 provider 目录"这条主线在 v0.81 周期的一次具体兑现。
+
+（注意：`Agent` 类一侧的 `streamFn` 选项**仍然存在**（`agent.ts:101`），只是它在内部被规整为 `this.streamFunction = runtimeOptions.streamFn ?? getDefaultStreamFn()`（`agent.ts:216`）—— 同一套"入口兜底"逻辑。要强调的是：`AgentOptions.streamFn` 在**类型上仍是必填**（字段没有 `?`），所以 TS 调用方并不能省略它；这里的 `?? getDefaultStreamFn()` 兜底只在**运行时**对 JS 调用方或显式传入 `undefined` 的情形生效，不要据此以为 TS 下可以不传。第 10 章还会再遇到它。）
 
 ## `AgentLoopConfig`：循环引擎的全部知识
 
@@ -402,9 +463,15 @@ agent_end
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0，并同步到 v0.79.7。`runLoop()` 的双层循环结构
+> 本章核心分析基于 pi-mono v0.66.0，并已对照 v0.82.1。`runLoop()` 的双层循环结构
 > 自引入以来保持稳定，steering/follow-up 消息队列在早期版本中从单队列拆分为双队列。
 > v0.69.0 起内层续轮条件由"是否还有 tool calls"改为基于工具批次的 `terminate` 提示
 > （`executeToolCalls` 现返回 `{ messages, terminate }`）；v0.72.0 在每个 turn 之间新增
 > `prepareNextTurn`（热切换 model/context/thinkingLevel）与 `shouldStopAfterTurn`
-> （turn 后优雅停止）两个可选回调。
+> （turn 后优雅停止）两个可选回调。v0.80.3 起 `Agent` 在 `prepareNextTurn(signal)` 之外
+> 增补带 loop context 的 `prepareNextTurnWithContext(context, signal)` 变体（两者并存时优先
+> 后者），且 abort signal 已下发到 turn 间回调。v0.81.0 把底层 `runLoop` 的 stream 函数由可选
+> `streamFn?` 改为必填的 `streamFunction`（剥离循环对 pi-ai/compat 层的依赖），v0.81.1 又在
+> 公共入口补回宿主可配置的默认兜底（`stream-fn.ts` 的 `setDefaultStreamFn`/`getDefaultStreamFn`，
+> 入口以 `streamFn ?? getDefaultStreamFn()` 兜底）；`Agent` 类的 `streamFn` 选项仍在
+> （`agent.ts:101`），内部规整为 `streamFunction`。

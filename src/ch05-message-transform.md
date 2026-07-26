@@ -16,14 +16,32 @@
 - **Text signatures**：OpenAI 的 text block 携带 `textSignature`（消息元数据，legacy ID 或 `TextSignatureV1` JSON），跨模型时毫无意义
 - **Redacted thinking**：安全过滤后的加密内容，只有原模型能解码
 
-`transformMessages()` 函数用 172 行代码解决了这些问题。它的策略可以概括为一句话：**尽可能保留，不能保留的安全降级，绝不让变换导致 API 调用失败。**
+`transformMessages()` 函数（`packages/ai/src/api/transform-messages.ts:64`）解决了这些问题。它的策略可以概括为一句话：**尽可能保留，不能保留的安全降级，绝不让变换导致 API 调用失败。**
+
+> **路径订正（v0.80.0）**：这个函数随 API 实现整体从 `providers/transform-messages.ts` 迁到了 `api/transform-messages.ts`，本章所有行号已按当前源码更新。
+
+### 入口的第一道防线：null content 归一化
+
+在进入变换逻辑之前，`transformMessages` 先做一件防御性的事 — 把来路不明的 `content` 归一化：
+
+```typescript
+// packages/ai/src/api/transform-messages.ts:71-73
+
+// Normalize null/undefined content from untyped callers (custom tools,
+// hand-built histories, old session files) so downstream code can rely
+// on the type contract.
+const normalizedMessages = messages.map(
+  (msg) => (msg.content == null ? { ...msg, content: [] } : msg));
+```
+
+类型上 `content` 不该是 `null`，但历史消息的来源是开放的：自定义工具拼的消息、手工构造的历史、旧版本写下的 session 文件都可能带一个 `content: null`。与其让后续的 `.flatMap`/`.filter` 在某处抛 `Cannot read properties of null`，不如在入口把 `null`/`undefined` 统一成 `[]`（v0.80.4 补入）。这是"在边界处把非法输入收敛成合法输入"的典型防御 — 让下游代码可以无条件信任类型契约。
 
 ## 变换策略：同模型保持，跨模型降级
 
 `transformMessages` 的核心判断逻辑围绕一个布尔值 `isSameModel`：
 
 ```typescript
-// packages/ai/src/providers/transform-messages.ts:35-38
+// packages/ai/src/api/transform-messages.ts:95-98
 
 const isSameModel =
   assistantMsg.provider === model.provider &&
@@ -69,7 +87,7 @@ flowchart TD
 Thinking block 是整个变换逻辑中最复杂的部分。这不是因为代码多，而是因为 thinking 块有多种形态，每种的处理策略不同。先看类型定义：
 
 ```typescript
-// packages/ai/src/types.ts:143-151
+// packages/ai/src/types.ts:335-343
 
 export interface ThinkingContent {
   type: "thinking";
@@ -92,7 +110,7 @@ export interface ThinkingContent {
 每种情况的处理逻辑完全不同。以下是 `transformMessages` 中的完整决策代码：
 
 ```typescript
-// packages/ai/src/providers/transform-messages.ts:40-57
+// packages/ai/src/api/transform-messages.ts:100-117
 
 const transformedContent = assistantMsg.content.flatMap((block) => {
   if (block.type === "thinking") {
@@ -133,7 +151,7 @@ const transformedContent = assistantMsg.content.flatMap((block) => {
 Text block 是最"普通"的内容类型，但即使是文本块，跨模型时也需要变换：
 
 ```typescript
-// packages/ai/src/providers/transform-messages.ts:59-65
+// packages/ai/src/api/transform-messages.ts:119-125
 
 if (block.type === "text") {
   if (isSameModel) return block;
@@ -147,7 +165,7 @@ if (block.type === "text") {
 同模型时原样返回，跨模型时构造一个新的 `TextContent` 对象，只保留 `type` 和 `text` 两个字段。为什么不能直接 `return block`？因为 `TextContent` 类型上还有一个可选字段：
 
 ```typescript
-// packages/ai/src/types.ts:137-141
+// packages/ai/src/types.ts:329-333
 
 export interface TextContent {
   type: "text";
@@ -173,7 +191,7 @@ fc_682e1b1b5c9081919ecae4e2b4f73f710cf7bd7c89b44df5|call_RJxMmhTWpikOz4UMgkJbopv
 `transformMessages` 通过 `normalizeToolCallId` 回调解决这个问题：
 
 ```typescript
-// packages/ai/src/providers/transform-messages.ts:76-81
+// packages/ai/src/api/transform-messages.ts:136-142
 
 if (!isSameModel && normalizeToolCallId) {
   const normalizedId = normalizeToolCallId(
@@ -189,7 +207,7 @@ if (!isSameModel && normalizeToolCallId) {
 注意 `toolCallIdMap` 的设计：当一个 tool call ID 被归一化后，映射关系被存储起来。后续遇到对应的 `toolResult` 消息时，它的 `toolCallId` 也会被同步更新：
 
 ```typescript
-// packages/ai/src/providers/transform-messages.ts:24-29
+// packages/ai/src/api/transform-messages.ts:84-90
 
 if (msg.role === "toolResult") {
   const normalizedId = toolCallIdMap.get(msg.toolCallId);
@@ -201,7 +219,7 @@ if (msg.role === "toolResult") {
 
 tool call 和 tool result 的 ID 必须匹配，否则 API 会报错。归一化必须双向一致。
 
-同样值得注意的是 `thoughtSignature` 的处理（源码第 71-74 行）：Google 的 tool call 携带 `thoughtSignature` 用于思维链上下文复用，跨模型时这个字段被删除。这和 text block 的白名单策略不同 — tool call 由于有 `id`、`name`、`arguments` 等关键字段需要精确保留，这里用的是"黑名单"策略：显式删除已知的无关字段。
+同样值得注意的是 `thoughtSignature` 的处理（源码 `:131-134`）：Google 的 tool call 携带 `thoughtSignature` 用于思维链上下文复用，跨模型时这个字段被删除。这和 text block 的白名单策略不同 — tool call 由于有 `id`、`name`、`arguments` 等关键字段需要精确保留，这里用的是"黑名单"策略：显式删除已知的无关字段。
 
 ## 第二遍扫描：合成缺失的 Tool Result
 
@@ -217,47 +235,48 @@ tool call 和 tool result 的 ID 必须匹配，否则 API 会报错。归一化
 
 ### 合成逻辑的完整代码
 
-第二遍扫描的核心是一个状态机，追踪"当前有哪些待回复的 tool call"：
+第二遍扫描的核心是一个状态机，追踪"当前有哪些待回复的 tool call"。合成逻辑被抽成一个闭包 `insertSyntheticToolResults`，在三个位置调用：
 
 ```typescript
-// packages/ai/src/providers/transform-messages.ts:98-124
+// packages/ai/src/api/transform-messages.ts:160-187（节选）
 
 const result: Message[] = [];
 let pendingToolCalls: ToolCall[] = [];
 let existingToolResultIds = new Set<string>();
+const insertSyntheticToolResults = () => {
+  if (pendingToolCalls.length > 0) {
+    for (const tc of pendingToolCalls) {
+      if (!existingToolResultIds.has(tc.id)) {
+        result.push({
+          role: "toolResult",
+          toolCallId: tc.id,
+          toolName: tc.name,
+          content: [{ type: "text", text: "No result provided" }],
+          isError: true,
+          timestamp: Date.now(),
+        } as ToolResultMessage);
+      }
+    }
+    pendingToolCalls = [];
+    existingToolResultIds = new Set();
+  }
+};
 
 for (let i = 0; i < transformed.length; i++) {
   const msg = transformed[i];
-
   if (msg.role === "assistant") {
-    // If we have pending orphaned tool calls from a
-    // previous assistant, insert synthetic results now
-    if (pendingToolCalls.length > 0) {
-      for (const tc of pendingToolCalls) {
-        if (!existingToolResultIds.has(tc.id)) {
-          result.push({
-            role: "toolResult",
-            toolCallId: tc.id,
-            toolName: tc.name,
-            content: [{ type: "text", text: "No result provided" }],
-            isError: true,
-            timestamp: Date.now(),
-          } as ToolResultMessage);
-        }
-      }
-      pendingToolCalls = [];
-      existingToolResultIds = new Set();
-    }
+    // 前一条 assistant 若有未回复的 tool call，先补合成 result
+    insertSyntheticToolResults();
 ```
 
-注意这里的时序：当遇到一条新的 assistant 消息时，如果前一条 assistant 还有未回复的 tool call，在新 assistant **之前**插入合成的 tool result。这保证了消息序列始终满足 `assistant(tool_call) → toolResult → assistant` 的交替模式。
+注意这里的时序：当遇到一条新的 assistant 消息时，如果前一条 assistant 还有未回复的 tool call，在新 assistant **之前**插入合成的 tool result。这保证了消息序列始终满足 `assistant(tool_call) → toolResult → assistant` 的交替模式。把合成逻辑抽成一个函数、在三处（遇到新 assistant、遇到 user 消息、以及转录收尾）统一调用，是 v0.80.0 之后的一次可读性重构 — 三种"孤立 tool call"场景共用同一段补齐代码。
 
 ### 错误/中止消息的跳过
 
 紧接着合成逻辑之后，是对 error 和 aborted 消息的处理：
 
 ```typescript
-// packages/ai/src/providers/transform-messages.ts:126-134
+// packages/ai/src/api/transform-messages.ts:189-197
 
 // Skip errored/aborted assistant messages entirely.
 // These are incomplete turns that shouldn't be replayed:
@@ -280,33 +299,17 @@ if (assistantMsg.stopReason === "error"
 第二遍扫描还处理一种特殊场景：**用户消息打断了 tool 流**。正常的 agent 循环是 `assistant(tool_call) → toolResult → assistant`，但用户可以在任何时候发送新消息。如果用户在 assistant 发出 tool call 后、tool result 返回前发送了新消息，tool call 就变成了孤立的：
 
 ```typescript
-// packages/ai/src/providers/transform-messages.ts:147-165
+// packages/ai/src/api/transform-messages.ts:210-213
 
 } else if (msg.role === "user") {
   // User message interrupts tool flow - insert synthetic
   // results for orphaned calls
-  if (pendingToolCalls.length > 0) {
-    for (const tc of pendingToolCalls) {
-      if (!existingToolResultIds.has(tc.id)) {
-        result.push({
-          role: "toolResult",
-          toolCallId: tc.id,
-          toolName: tc.name,
-          content: [{ type: "text",
-                      text: "No result provided" }],
-          isError: true,
-          timestamp: Date.now(),
-        } as ToolResultMessage);
-      }
-    }
-    pendingToolCalls = [];
-    existingToolResultIds = new Set();
-  }
+  insertSyntheticToolResults();
   result.push(msg);
 }
 ```
 
-这段代码和 assistant 消息触发的合成逻辑几乎一样 — 因为处理策略是相同的：在用户消息**之前**插入合成的 tool result，修复断裂的消息序列。`existingToolResultIds` 的检查保证了如果部分 tool call 已经有了真实的 result（比如 assistant 发了 3 个 tool call，2 个已经有 result，用户在第 3 个执行完之前发了消息），只为缺失的那些补充合成 result。
+因为合成逻辑已经抽成 `insertSyntheticToolResults`，user 分支只需复用同一个闭包 — 处理策略是相同的：在用户消息**之前**插入合成的 tool result，修复断裂的消息序列。闭包内 `existingToolResultIds` 的检查保证了如果部分 tool call 已经有了真实的 result（比如 assistant 发了 3 个 tool call，2 个已经有 result，用户在第 3 个执行完之前发了消息），只为缺失的那些补充合成 result。
 
 合成的 tool result 都标记为 `isError: true`，内容为 `"No result provided"`。这个设计有双重目的：一是满足 API 的格式要求（每个 tool call 必须有对应的 result），二是给模型一个信号 — 这个工具调用的结果是不可靠的，模型应该考虑重新调用或采取其他策略。
 
@@ -449,7 +452,8 @@ if (assistantMsg.stopReason === "error"
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0，截至 v0.79.7 整体策略未变。`transformMessages` 的策略随 provider 的增加
-> 不断演进：redacted thinking 处理、thoughtSignature 清理、合成 tool result 都是
-> 在遇到实际 API 错误后逐步添加的防御措施。v0.69.0 补充了"以未回复 tool call 结尾"的收尾合成分支（见上文）。
+> 本章内容已对照 pi-mono **v0.82.1**。本章的变换策略整体未变，但有两处需要订正：
+> - **路径迁移（v0.80.0）**：`transformMessages` 随 API 实现从 `providers/transform-messages.ts` 迁到 `api/transform-messages.ts`；本章行号已全部按当前源码更新，`transformMessages` 现位于 `:64`。
+> - **null content 归一化（v0.80.4）**：入口新增 `content == null → []` 的防御（`:71-73`），见本章第二节。
+> 其余演进（redacted thinking 处理、thoughtSignature 清理、合成 tool result、v0.69.0 的收尾合成分支）都是在遇到实际 API 错误后逐步添加的防御措施；第二遍扫描已重构为共用 `insertSyntheticToolResults` 闭包。
 > 注意：跨模型示例中的 `api` 字段值是 `"anthropic-messages"`（与 `KnownApi` 一致），早期草稿误写为 `"messages"`。

@@ -38,20 +38,17 @@ flowchart TD
 
 ## 源码分析：`createAgentSession`
 
-SDK 的主入口是工厂函数 `createAgentSession`（`packages/coding-agent/src/core/sdk.ts:166`）。最小用法只有几行：
+SDK 的主入口是工厂函数 `createAgentSession`（`packages/coding-agent/src/core/sdk.ts:169`）。最小用法只有几行：
 
 ```typescript
-// docs/sdk.md
-import { AuthStorage, createAgentSession, ModelRegistry,
+import { createAgentSession, ModelRuntime,
          SessionManager } from "@earendil-works/pi-coding-agent";
 
-const authStorage = AuthStorage.create();
-const modelRegistry = ModelRegistry.create(authStorage);
+const modelRuntime = await ModelRuntime.create();
 
 const { session } = await createAgentSession({
   sessionManager: SessionManager.inMemory(),
-  authStorage,
-  modelRegistry,
+  modelRuntime,
 });
 
 session.subscribe((event) => {
@@ -64,12 +61,14 @@ session.subscribe((event) => {
 await session.prompt("What files are in the current directory?");
 ```
 
+> **Breaking（v0.80.8）**：这段最小示例在旧版本里是 `AuthStorage.create()` + `ModelRegistry.create(authStorage)` 两件套传入 `createAgentSession`。现在 `CreateAgentSessionOptions` 的模型/认证入口**只剩一个异步的 `modelRuntime?: ModelRuntime`**（`sdk.ts:45`）；`authStorage` / `modelRegistry` 选项已移除。`ModelRuntime.create()` 内部会用 `agentDir/auth.json` + `models.json` 装配好凭证、内建目录、动态目录（第 18 章）。连 `modelRuntime` 都可以省略 —— 不传时 `createAgentSession` 自己 `await ModelRuntime.create({…})`（`sdk.ts:176`）。相应地，`AuthStorage` 及其后端**不再从包根导出**；若只想读一条已存凭证，用 `readStoredCredential()`（`index.ts:26`），或直接用 `ModelRuntime`（也可用 pi-ai 的 `CredentialStore`，见第 4-7 章认证子系统）。
+
 注意几个设计点：
 
 **1. 全部有默认值，渐进式覆盖**。不传任何参数，`createAgentSession()` 就用 `DefaultResourceLoader` 走标准发现流程、用 `SessionManager.create(cwd)` 落盘会话。需要时再逐项覆盖：
 
 ```typescript
-// CreateAgentSessionOptions（sdk.ts:55-90 节选）
+// CreateAgentSessionOptions（sdk.ts:37-86 节选）
 const { session } = await createAgentSession({
   model: myModel,
   tools: ["read", "bash"],          // 名字白名单（第 19 章）
@@ -94,6 +93,31 @@ const { session } = await createAgentSession({
 
 SDK 还把一批原本是内部细节的构件提升为公共导出，让宿主不必重新造轮子。例如第 20 章提到的 `generateDiffString` / `generateUnifiedPatch` / `EditDiffResult`、第 26 章的 typed `RpcClient`、图片处理（`convertToPng` / resize）、参数解析 `parseArgs`、`CONFIG_DIR_NAME`、以及包内资源路径 helper。这些导出意味着：你可以只取用 pi 的某个能力（比如生成 unified patch），而不必启动整个 agent。
 
+本区间新增/提升的公共导出还包括：
+
+- **`ModelRuntime`**（`index.ts:180`）—— 如上文，模型/认证的规范门面；`ModelRegistry` 仍导出（`index.ts:169`）但仅作 extension 用的同步 compat 投影。
+- **`InlineExtension`**（`index.ts:96`）—— 让宿主**内联**声明一个 extension（直接给对象，而非指向磁盘上的 extension 文件路径），SDK 场景下无需为一个临时 hook 单独建文件。
+- **消息与工具执行的生命周期事件类型**（如 `message_end`、工具执行的 start/update/end 事件类型），让 TypeScript 宿主能类型安全地 `subscribe` 并 narrow 事件。
+- **`JsonlSessionStorage` / `InMemorySessionStorage`**（可插拔存储后端，第 11 章）—— 宿主可自带存储实现，或在 `SessionManager` 之外直接用它们控制会话怎么落盘。
+- **CLI 等价的 model 解析** helper —— 把用户在命令行写的 `provider/model:thinking` 串解析成 `Model` 对象，让 SDK 宿主复用与 CLI 完全一致的选模型语义。
+
+## 第二消费者：evals harness
+
+SDK 有没有真实的第二消费者，是检验"可嵌入库"定位是否成立的试金石 —— 如果只有 pi 自己的 CLI 用 `createAgentSession`，那这套嵌入 API 很容易在演进中悄悄退化。本区间新增的私有包 `packages/evals`（pi-evals，不发布）正是这样一个消费者：它是一套基于 `vitest-evals` 的评测 harness，用 `createHarness` 驱动**真实的** `createAgentSession`，在临时 workspace 里跑任务、汇报最终消息 / transcript / token usage。
+
+```typescript
+// file: packages/evals/src/pi-harness.ts:4-11（节选重排）
+import {
+  createAgentSession, DefaultResourceLoader,
+  ModelRuntime, SessionManager, SettingsManager,
+} from "@earendil-works/pi-coding-agent";
+import { createHarness } from "vitest-evals/harness";
+```
+
+它的 import 面把本章讲的构件都串了起来：`ModelRuntime`（上文的规范门面）、`DefaultResourceLoader`、`SessionManager`、`SettingsManager`。harness 从环境变量 `PI_PROVIDER` / `PI_MODEL` 读出要评测的模型（`getRequiredModelSelection()`），装配一个真实 session 跑完再 dispose、清理临时目录。
+
+这个消费者有两层意义。其一，它是 SDK 面的**回归护栏** —— evals 每次运行都在走真实的嵌入路径，`createAgentSession` 的签名一旦破坏就会立刻暴露。其二，它把两个看似无关的特性连了起来：evals 依赖 `PI_PROVIDER` / `PI_MODEL` 这两个**会话环境变量**（第 22 章）来选模型，而这些变量本身是 bash 工具注入子进程的会话上下文的一部分。换句话说，"SDK 嵌入"（本章）和"bash 会话环境变量"（第 22 章）在 evals harness 这里第一次同时落地成一个真实用例。
+
 ## 模式提炼
 
 **嵌入 vs 驱动的选择**：
@@ -117,4 +141,8 @@ SDK 还把一批原本是内部细节的构件提升为公共导出，让宿主�
 ---
 
 ### 版本演化说明
-> 本章描述的 SDK 嵌入路径在 v0.66.1（本书基线）尚未作为一等公民成型，是 pi 走向"可嵌入库"定位后逐步固化的，校订至 v0.79.7。关键节点：`createAgentSession` 的 `tools: string[]` 名字白名单（v0.68.0）；工具参数校验切到 `typebox` 1.x，使其在禁用 `eval` 的运行时（如 Cloudflare Workers）也能执行（v0.69.0）；摘要 prompt 中性化以支持非编码复用（v0.79.0）；嵌入时不再强制要求相邻的 package.json 文件（v0.78.1）。`AgentSession` 的方法面与第 10 章 Agent、第 26 章 RPC 命令保持一一对应。
+> 本章描述的 SDK 嵌入路径在 v0.66.1（本书基线）尚未作为一等公民成型，是 pi 走向"可嵌入库"定位后逐步固化的，已对照 **v0.82.1**。
+> 本区间最重要的是一处 **Breaking（v0.80.8）**：`CreateAgentSessionOptions` 移除 `authStorage` / `modelRegistry`，改为单一异步入口 `modelRuntime?: ModelRuntime`（`sdk.ts:45`）；`AuthStorage` 不再从包根导出，读凭证改用 `readStoredCredential()`（`index.ts:26`）或 `ModelRuntime`（第 18 章）。最小示例已相应重写为 `ModelRuntime.create()` + `modelRuntime`。
+> 新导出面：`ModelRuntime`（`index.ts:180`）、`InlineExtension`（`index.ts:96`）、消息/工具执行生命周期事件类型、`JsonlSessionStorage` / `InMemorySessionStorage`、CLI 等价 model 解析。
+> 新增真实第二消费者 `packages/evals`（pi-evals，`createHarness` 驱动真实 `createAgentSession`，依赖 `PI_PROVIDER`/`PI_MODEL`），既是 SDK 面回归护栏，也串起第 22 章的会话环境变量。
+> 更早的关键节点仍成立：`tools: string[]` 名字白名单（v0.68.0）；工具参数校验切到 `typebox` 1.x（v0.69.0）；摘要 prompt 中性化以支持非编码复用（v0.79.0）；嵌入时不再强制相邻 package.json（v0.78.1）。`AgentSession` 的方法面与第 10 章 Agent、第 26 章 RPC 命令保持一一对应。

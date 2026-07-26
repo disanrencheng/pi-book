@@ -485,6 +485,26 @@ async reload(): Promise<void> {
 
 `reload` 先等待写入队列完成（防止读到半写的状态），然后重新从存储加载两级配置。这是一个"热重载"机制 — 用户不需要重启 pi 就能看到配置变更的效果。
 
+## 编辑哪一层：`pi config -l` 与作用域切换
+
+前面讲的都是配置**如何合并**，但还有一个操作性的问题：当用户想改一个设置，他改的是全局那份还是项目那份？这两份文件路径不同（`~/.pi/agent/settings.json` vs `{cwd}/.pi/settings.json`），语义也不同 —— 全局是"我的个人偏好"，项目是"这个仓库的约定，会提交进 git"。
+
+pi 用一个显式的作用域概念把这件事摆到台面上。命令行入口是 `pi config`：
+
+```
+// package-manager-cli.ts:92,99-103
+pi config [-l] [--approve|--no-approve]
+
+不带 -l：编辑全局设置（~/.pi/agent/settings.json）
+-l, --local：编辑项目覆盖（.pi/settings.json）
+```
+
+`config`（含 `install`/`remove` 等包管理子命令）默认落在**全局**，加 `-l` / `--local` 才写**项目本地**那一层（v0.80.4）。交互式配置编辑器里则用 **Tab 键在"全局 / 项目"两个作用域之间切换** —— 同一个设置项，用户可以清楚地看到、并选择自己在往哪一层写。这解决了三级覆盖的一个隐蔽痛点：如果不告诉用户"你现在改的是哪一层"，他很容易把本该是项目约定的设置写进了全局、或反之。
+
+这一层"项目本地资源"和第 17 章 Resource Loader 的项目本地资源覆盖是同一个作用域概念的两面 —— 一个管 `settings.json` 的分层，一个管 extensions/skills/prompts 的分层，都受同一道 Project Trust 闸门（下节）管辖。
+
+顺带一提本区间新增的几个 settings（都遵循前述 optional + getter 默认值的模式）：`externalEditor`（`Ctrl+G` 外部编辑器命令，优先于 `VISUAL`/`EDITOR`，`settings-manager.ts:97`）、`outputPad`（聊天输出的水平留白，`0 | 1`，`:120`）、`showCacheMissNotices`（在 transcript 里提示明显的 prompt-cache miss，`:96`），以及 `shellPath` 现在支持**开头 `~` 展开**（`:98`/`:880`，Cygwin 等场景更省事）。
+
 ## 第四道闸门：Project Trust
 
 到这里为止，本章一直把"项目级配置覆盖全局"当作无条件的事实 —— 进入一个目录，它的 `.pi/settings.json`、`AGENTS.md`、甚至 `packages`/`extensions`/`skills` 就自动加载并生效。但从 **v0.79.0** 起，这个假设不再成立。
@@ -547,8 +567,9 @@ flowchart TD
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0，已校订至 v0.79.7。三级覆盖的核心结构自引入以来稳定，但有两处设计级增补：
-> ① **Project Trust 信任闸门**（v0.79.0）：项目本地 settings/resources/extensions/packages/skills 的加载现在受 `defaultProjectTrust`（ask/always/never）、`--approve`、`/trust` 与 `~/.pi/agent/trust.json` 管辖，不再无条件加载。
-> ② **重试配置分层**（v0.70.1）：`retry` 拆为应用层退避与 `retry.provider.*`（透传 SDK），旧 `retry.maxDelayMs` 自动迁移到 `retry.provider.maxRetryDelayMs`。
-> 此外 Settings 可配置项持续扩展（httpProxy、httpIdleTimeoutMs、自动 light/dark 主题等），`.pi` 目录名由 `CONFIG_DIR_NAME` 提供以支持 rebrand。
+> 本章核心分析基于 pi-mono v0.66.0，已对照 **v0.82.1**。三级覆盖的核心结构自引入以来稳定，但有几处设计级增补：
+> ① **配置作用域切换**（v0.80.4）：`pi config -l` 编辑项目本地那层、交互编辑器用 Tab 切换全局/项目作用域；与第 17 章项目本地资源覆盖同属一个作用域概念。
+> ② **Project Trust 信任闸门**（v0.79.0）：项目本地 settings/resources/extensions/packages/skills 的加载受 `defaultProjectTrust`（ask/always/never）、`--approve`、`/trust` 与 `~/.pi/agent/trust.json` 管辖，不再无条件加载。
+> ③ **重试配置分层**（v0.70.1）：`retry` 拆为应用层退避与 `retry.provider.*`（透传 SDK），旧 `retry.maxDelayMs` 自动迁移到 `retry.provider.maxRetryDelayMs`。
+> ④ 新增 settings：`externalEditor`、`outputPad`、`showCacheMissNotices`，`shellPath` 支持开头 `~` 展开（v0.80.3/v0.80.4/v0.80.6）；此外 httpProxy、httpIdleTimeoutMs、自动 light/dark 主题等持续扩展，`.pi` 目录名由 `CONFIG_DIR_NAME` 提供以支持 rebrand。
 > `AGENTS.md`/`CLAUDE.md` 双支持、PackageSource 对象格式、`migrateSettings` 自动迁移均保持不变。

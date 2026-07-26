@@ -36,7 +36,7 @@
 
 | 模式 | 出现位置 | 章节 | 模式说明 |
 |------|---------|------|---------|
-| 插件注册（Map + register/get） | api-registry.ts, oauth/index.ts | 第 4、7 章 | 用注册表 `Map` 存储，`register()` 添加，`get()` 查找。api-registry 按 `api` 键控，不用 DI 框架，不用反射 |
+| 显式集合装配（createProvider + setProvider） | models.ts, providers/*.ts, auth/oauth/ | 第 4、7 章 | 用 `Models` 集合把 provider 显式组装进来（`createProvider`/`setProvider`），认证随 `Provider.auth` 一并装配；不用 DI 框架、不用反射。早期的全局 `api-registry.ts` / `oauthProviderRegistry` 已于 v0.80.0 起被这套显式集合取代 |
 | 有损变换（isSameModel 判断） | transform-messages.ts | 第 5 章 | 跨模型消息变换时，标记信息丢失（如 thinking 块），便于下游处理 |
 | 流式契约（Must not throw） | StreamFn type, AgentLoopConfig | 第 6、8 章 | Provider 的 stream 函数承诺不抛异常，错误通过事件流传递。调用方不需要 try-catch |
 | 双层循环（steering + follow-up） | agent-loop.ts runLoop() | 第 8 章 | 外层 steering 循环处理模型切换和重试，内层 follow-up 循环处理工具调用后的后续对话 |

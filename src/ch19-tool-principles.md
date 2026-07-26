@@ -75,6 +75,29 @@ export interface ToolDefinition<
 2. **`prepareArguments` 是兼容性钩子** — 当 LLM 使用旧版参数格式时，在 schema 验证之前转换参数（edit 工具用这个把 `oldText/newText` 转为 `edits[]`，详见第 20 章）
 3. **`promptSnippet` 和 `promptGuidelines`** — 工具不仅定义参数，还参与 system prompt 的组装。工具激活时，它的 guidelines 会自动注入到 prompt 中
 
+## 受约束采样：让 provider 在解码时就保证结构（v0.82.0）
+
+TypeBox schema 验证是**事后**的：LLM 先自由生成一段 JSON，pi 再拿 schema 去校验，失败就退回让它重试。这一节讲的是另一条更强的路 —— 让 provider 在**解码时**就把输出约束在合法结构里，从源头上不产生非法 tool call。承载它的是 `ToolDefinition` 上新增的一维契约字段 `constrainedSampling`：
+
+```typescript
+// packages/coding-agent/src/core/extensions/types.ts:457
+constrainedSampling?: false | ConstrainedSamplingConfig;
+
+// packages/ai/src/types.ts:460-468
+export type ConstrainedSamplingConfig =
+  | { type: "json_schema"; strict: "prefer" | "require" }
+  | { type: "grammar"; variants: GrammarVariants };  // Lark / regex
+```
+
+两种约束模式对应两类需求：
+
+- **`json_schema`** —— 要求 provider 按工具的 JSON Schema 做严格解码。`strict` 有 `"prefer"`（能严格就严格，provider 不支持则降级为普通 tool call）和 `"require"`（必须严格，否则报错）两档 —— 这个"偏好 vs 强制"的区分让工具作者能在"尽量结构化"和"绝不接受非结构化输出"之间选位置。
+- **`grammar`** —— 用形式文法（Lark 语法或 regex）约束输出，适合参数不是普通 JSON、而是某种领域小语言的工具（如受限的查询表达式）。
+
+关键在于：**这维契约不是无条件生效的，它由模型能力位把关**。模型目录里带两个 compat 能力位 —— `supportsStrictTools`（provider 是否接受严格 JSON-schema 工具定义，`model-config.ts:129`；内建 Anthropic 模型在生成的 metadata 里默认开启）和 `supportsGrammarTools`（是否支持自定义文法工具，OpenAI GPT-5+、Codex、Azure OpenAI 等开启）。工具声明了 `constrainedSampling`，但只有当**当前模型的对应能力位为真**时才会真正下发严格/文法约束，否则回退成普通 tool call。这样同一个工具定义能跨不同能力的模型工作，而不必为每个 provider 分叉。
+
+这正是"约束即保护"在协议层的延伸：TypeBox 是 pi 侧的事后校验，`constrainedSampling` 是 provider 侧的事前保证，两者叠加把"LLM 发出结构非法的 tool call"这类错误压到最低。
+
 ## 七个内置工具的 Schema 一览
 
 每个工具的参数定义都是 `Type.Object`（6 个结构化工具加上 bash 后备，共 7 个）— 以下并排展示它们的参数结构，方便看出设计差异：
@@ -317,7 +340,8 @@ interface EditOperations {
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0，已校订至 v0.79.7。6 个结构化工具（read/write/edit/find/grep/ls）+ bash 后备是逐步从 bash 中分离出来的 —
+> 本章核心分析基于 pi-mono v0.66.0，已对照 **v0.82.1**。6 个结构化工具（read/write/edit/find/grep/ls）+ bash 后备是逐步从 bash 中分离出来的 —
 > 早期版本只有 bash + read + edit，后来加入 write、find、grep、ls，工具名集中在 `allToolNames`。
-> 主要设计级变化：v0.68.0 重写工具激活模型 —— 从导出预构建工具对象改为"字符串名字白名单 + cwd 工厂"（`createTool(name, cwd)` / `createCodingTools(cwd)`），SDK 用 `tools: string[]` 选择、CLI 用 `--tools`/`--no-tools`/`--no-builtin-tools`/`--exclude-tools`。
+> 主要设计级变化：① 工具契约新增**受约束采样**维度 `constrainedSampling`（`extensions/types.ts:457`，v0.82.0）—— prefer/require 严格 JSON Schema 或 Lark/regex 文法，由 `supportsStrictTools`/`supportsGrammarTools` 能力位把关；
+> ② v0.68.0 重写工具激活模型 —— 从导出预构建工具对象改为"字符串名字白名单 + cwd 工厂"（`createTool(name, cwd)` / `createCodingTools(cwd)`），SDK 用 `tools: string[]` 选择、CLI 用 `--tools`/`--no-tools`/`--no-builtin-tools`/`--exclude-tools`。
 > `ToolDefinition` 接口在 extension 系统（第 15 章）引入后统一；参数 schema 改用 `typebox` 1.x（第 15 章）。

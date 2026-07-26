@@ -9,10 +9,10 @@
 | 优先级 | 文件 | 理由 |
 |--------|------|------|
 | 1 | `packages/agent/src/types.ts` | 定义了 Agent 系统的全部类型 |
-| 2 | `packages/ai/src/api-registry.ts` | 98 行，极简的 provider 注册 |
+| 2 | `packages/ai/src/models.ts` | `Models` 运行时 + `createProvider`：provider 注册与模型解析核心 |
 | 3 | `packages/agent/src/agent-loop.ts` | 循环引擎核心 |
 | 4 | `packages/agent/src/agent.ts` | 有状态壳 |
-| 5 | `packages/ai/src/stream.ts` | 公共 API 入口 |
+| 5 | `packages/ai/src/index.ts` | pi-ai 层的公共导出面 |
 | 6 | `packages/ai/src/types.ts` | Model、Context、Event 定义 |
 | 7 | `packages/coding-agent/src/core/session-manager.ts` | 会话树 |
 | 8 | `packages/coding-agent/src/core/system-prompt.ts` | Prompt 装配 |
@@ -23,13 +23,13 @@
 
 **1. `packages/agent/src/types.ts`** — 这是整个 agent 系统的 "schema"。你会在这里找到 `AgentMessage`（所有消息类型的联合）、`AgentTool`（工具的定义接口）、`AgentEvent`（循环引擎产出的事件流）和 `AgentLoopConfig`（循环的配置项）。理解这些类型后，你看任何其他文件都能立刻知道数据流的形状。这个文件不长，但信息密度极高 — 建议逐行读完。
 
-**2. `packages/ai/src/api-registry.ts`** — 只有 98 行的 API provider 注册表。你会看到 `registerApiProvider` 函数和 `getApiProvider` 函数 — 前者把一个 `api` 标识和一组流式调用函数绑定在一起，后者根据 `model.api` 取出对应实现。整个系统的 LLM 调用多态性就建立在这 98 行之上。读完它你会理解为什么添加一个新 provider 如此简单。
+**2. `packages/ai/src/models.ts`** — pi-ai 的运行时集合 `Models` 与 provider 工厂 `createProvider` 所在。它取代了早期那个 98 行的 `api-registry.ts` 全局注册表：v0.80 起 provider 不再挂到一个隐式全局表上，而是显式地注册进一个 `Models` 运行时对象，模型解析和流式调用的分发都从这里出发。整个系统"如何添加一个新 provider、如何按 `model.api` 找到实现"的答案都在这个文件里（这次"隐式全局单例 → 显式依赖注入集合"的范式迁移，来龙去脉见第 4 章）。
 
 **3. `packages/agent/src/agent-loop.ts`** — 循环引擎的完整实现。你会看到一个 `while(true)` 循环，里面的逻辑是：调用 LLM → 收集事件 → 如果有 tool call 就执行 → 把 tool result 放回消息列表 → 继续循环。关键点是：这个函数是**纯函数式**的 — 它的所有输入（消息、工具、配置）都从参数传入，所有输出都通过事件流返回。第 8 章会详细分析这个设计。
 
 **4. `packages/agent/src/agent.ts`** — agentLoop 的有状态包装器。你会看到 `Agent` 类持有消息历史、工具列表、abort controller 等状态，然后在内部调用 agentLoop。它的存在回答了一个问题：如果循环引擎是无状态的，状态保存在哪里？答案是这个薄壳。它是 "stateful convenience layer"。
 
-**5. `packages/ai/src/stream.ts`** — pi-ai 层的公共 API 入口。你会看到 `stream` 函数 — 给定一个 model 和 context，返回一个 `AssistantMessageEventStream`。这是整个系统中离 "调用 LLM" 最近的接口。它的实现很简单：按 `model.api` 从 api-registry 取出对应实现，然后调用它。简单是因为复杂性被推到了各个 provider 的实现中。
+**5. `packages/ai/src/index.ts`** — pi-ai 层的公共导出面。你会在这里一眼看全 ai 层对外暴露了什么：`Models` 运行时与 provider 工厂、`auth/` 认证子系统、以及 `types.ts` 里的核心类型。想知道"从外部能怎么用 pi-ai"，从这个出口读起最快；至于一次 LLM 调用具体怎么按 `model.api` 分发到各 provider，第 4-6 章会顺着 `Models` 展开。
 
 **6. `packages/ai/src/types.ts`** — pi-ai 层的类型系统。你会找到 `Model` 类型（一个模型的完整元数据：id、provider、cost、context window 等）、`Context` 类型（发送给 LLM 的完整上下文：messages、tools、system prompt 等）和各种事件类型。这些类型定义了 pi-ai 层的 "公共 API 契约" — 上层代码（agent-core）只通过这些类型与 ai 层交互。
 
@@ -57,6 +57,10 @@
 | `packages/coding-agent/src/core/extensions/loader.ts` | Extension 加载机制，工程实现 |
 
 这些文件不是不重要 — 它们只是不应该**先**读。它们是"设计的消费者"，不是"设计本身"。
+
+### 三个不在核心阅读路径上的包
+
+除了上面涉及的四个核心包，仓库里还有三个包不在阅读清单里，因为它们不属于"理解内核"的必经之路：`packages/server`（实验性常驻服务宿主，坐在 coding-agent 之上，CLI/API 尚未稳定）、`packages/storage/sqlite-node`（可选的 SQLite 会话存储后端，没有任何已发布包依赖它）、`packages/evals`（`vitest-evals` 驱动的私有评测 harness）。想理解 pi 的核心设计时可以先跳过它们；需要时第 2 章给了它们各自的定位。
 
 ## 类型如何串连整个系统
 
@@ -125,11 +129,11 @@ graph TD
 
 **不要从 TUI 开始读**。TUI 组件有 35+ 个文件，大量的交互细节。它们是"上层消费者"，不是"设计核心"。先理解内核（第 1-6 项），再看 TUI 如何消费事件。
 
-**不要从 provider 实现开始读**。`anthropic.ts`、`openai-responses.ts` 等文件是"api-registry 的用户"，不是设计本身。先理解注册表，再看具体实现。
+**不要从 provider 实现开始读**。`packages/ai/src/providers/anthropic.ts` 等文件是 `Models` 运行时的具体分发目标，不是设计本身。先理解 `models.ts` 里 provider 如何注册、如何被按 `model.api` 分发，再看具体实现。
 
 **跟着类型走**。`agent/src/types.ts` 定义了 `AgentMessage`、`AgentEvent`、`AgentTool`、`AgentLoopConfig` — 这些类型串起了整个系统。从类型出发，看哪些函数使用它们。
 
-**用搜索代替目录浏览**。pi-mono 有约 200 个源文件（4 个包，coding-agent 占大头）。逐文件浏览效率极低。更好的策略是：找到一个你关心的类型或函数名，在整个仓库中搜索它的使用处。工具推荐：`grep -rn "AgentTool" packages/`。
+**用搜索代替目录浏览**。pi-mono 现在有 7 个 workspace 业务包、400 多个源文件（`pi-coding-agent` 与 `pi-ai` 两个包占了大头，`server` / `sqlite-node` / `evals` 合计不到 30 个）。逐文件浏览效率极低。更好的策略是：找到一个你关心的类型或函数名，在整个仓库中搜索它的使用处。工具推荐：`grep -rn "AgentTool" packages/`。
 
 ## 常见阅读误区
 
@@ -168,5 +172,7 @@ agent/src/types.ts 只有几百行，看起来"没什么内容"。但这个文�
 ---
 
 ### 版本演化说明
-> 本章文件列表基于 pi-mono v0.66.0 的目录结构。
-> 文件路径可能随版本变化，但"先读内核、后读产品层"的策略不变。
+> 本章阅读路线以 pi-mono v0.66.0 的目录结构为骨架，并已对照 v0.82.1（2026 年 7 月）核实：
+> 引用的文件路径均在当前仓库存在，pi-ai 的 provider 注册入口已从早期的 `api-registry.ts` /
+> `stream.ts` 迁移到 `models.ts`（`Models` 运行时，详见第 4 章）。仓库现有 7 个 workspace
+> 业务包（结构见第 2 章）。文件路径可能随版本继续变化，但"先读内核、后读产品层"的策略不变。

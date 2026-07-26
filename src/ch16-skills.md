@@ -352,6 +352,7 @@ pi 的判断：对于大多数 agent 的"能力扩展"需求，**告诉 LLM 怎�
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0，已校订至 v0.79.7。Skill 机制自引入以来保持简洁：六字段接口、三条发现规则、全局优先于项目、XML 注入均不变。
-> 主要变化：① 名称验证放宽（v0.74.1）—— `name` 与父目录名不一致不再告警，`validateName` 签名简化；② 显式 `/skill:name` 触发用 XML wrapper 包裹 skill 指令与用户消息（v0.73.1，间距修复 v0.79.0/#5371），HTML 导出会剥离该 wrapper（#4234）。
+> 本章核心分析基于 pi-mono v0.66.0，已对照 **v0.82.1**。**v0.79.7 → v0.82.1 区间无 skills 专属变更** —— skill 机制的六字段接口、三条发现规则、全局优先于项目、XML 注入、名称验证均未变动；本次仅确认口径对齐 v0.82.1。
+> 更早的两处变化仍成立：① 名称验证放宽（v0.74.1）—— `name` 与父目录名不一致不再告警，`validateName` 签名简化；② 显式 `/skill:name` 触发用 XML wrapper 包裹 skill 指令与用户消息（v0.73.1，间距修复 v0.79.0/#5371），HTML 导出会剥离该 wrapper（#4234）。
 > Frontmatter 字段限制（name ≤64、description ≤1024）、npm 包 skill 发现、`disable-model-invocation` 区分自动/显式触发均保持。
+> （注：skills 在 system prompt 中的注入 `formatSkillsForPrompt` 与第 14/15 章的 prompt-cache 稳定性纪律相关，但那些是 prompt 装配/extension 侧的变化，skill 机制本身不变。）

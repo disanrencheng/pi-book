@@ -111,7 +111,7 @@ export interface FindOperations {
 
 `fd` 是一个 Rust 写的 `find` 替代品，默认尊重 `.gitignore`、速度极快。find 工具通过 `ensureTool("fd", true)`（find.ts:214）确保它可用（必要时自动下载），然后用 `spawn` 流式调用。调用参数里有两个值得注意的细节（find.ts:228-246）：
 
-- **`--no-require-git`**：让 fd 即使在非 git 目录也应用**层级 `.gitignore`**，而不是退化为读取某个全局 ignore 文件（后者会泄漏兄弟目录的规则）。
+- **`--no-require-git`（仅在非 git 目录时加）**：fd 默认在 git 仓库外不读 `.gitignore`；这个 flag 让它即便在非 git 目录也应用**层级 `.gitignore`**。但 find 工具会先探一下当前是否在 git 仓库内（向上找 `.git`，find.ts:232），**只有不在仓库里才加** `--no-require-git`。**在仓库内则用 fd 的默认 git-aware 行为**，这样父仓库的 `.gitignore` 规则会**停在嵌套子仓库的边界**上、不越界（v0.79.10，#5960）—— 否则一个把某子目录 ignore 掉的父 `.gitignore` 会连带屏蔽掉那个其实是独立 git 仓库的子目录里的文件。
 - **`--full-path`**：fd 的 `--glob` 默认只匹配文件名（basename）。当 LLM 给的 pattern 含路径分隔符（如 `src/**/*.spec.ts`）时，find 工具会加上 `--full-path`，让 glob 匹配完整路径而非仅文件名 —— 这样"按目录结构搜文件"才能正确工作。
 
 这是一个"能力增强"的设计 — 核心功能不依赖外部工具，但用上 fd 后性能与 `.gitignore` 行为都更好。
@@ -196,7 +196,7 @@ find 结果在 TUI 中按文件路径显示，每条结果一行，超过 10 条
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0，已校订至 v0.79.7。find 和 grep 是较晚从 bash 中分离出来的工具，`Operations` pluggable 设计与三层截断保护保持不变。
-> 主要实现级演进：grep 改为以 ripgrep `--json` **流式**运行（全程可取消、不阻塞，取代同步逐文件读取）；find 用 fd 并加 `--no-require-git`（层级 .gitignore）与 `--full-path`（路径型 glob，如 `src/**/*.spec.ts`）；
+> 本章核心分析基于 pi-mono v0.66.0，已对照 **v0.82.1**。find 和 grep 是较晚从 bash 中分离出来的工具，`Operations` pluggable 设计与三层截断保护保持不变。
+> 主要实现级演进：① find **尊重嵌套 git 仓库边界**（v0.79.10，#5960）—— 仓库内用 fd 默认 git-aware 行为，父 `.gitignore` 规则停在子仓库边界；仅在非 git 目录才加 `--no-require-git`；② grep 改为以 ripgrep `--json` **流式**运行（全程可取消、不阻塞，取代同步逐文件读取）；③ find 用 fd 并加 `--full-path`（路径型 glob，如 `src/**/*.spec.ts`）；
 > 另外 grep/find 对以 `-` 开头的 flag-like pattern 用 `--` 分隔做了注入修复（v0.71.0）。
 > `GREP_MAX_LINE_LENGTH` 的 500 字符限制根据 minified 文件噪声问题调整。

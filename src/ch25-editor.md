@@ -8,7 +8,7 @@
 
 pi 的 Editor 组件处理的不只是"输入文字"：
 
-- **多行编辑**：`Shift+Enter` / `Ctrl+Enter` 换行（取决于终端能力）
+- **多行编辑**：`Shift+Enter` 或 `Ctrl+J` 换行（默认键位见 `keybindings.ts:118`，具体哪个可用取决于终端能力）
 - **`@` 文件引用**：输入 `@` 触发模糊文件搜索，选中后附加为上下文
 - **`!command` 执行**：输入 `!` 前缀运行 bash，输出送入 LLM
 - **`Tab` 路径补全**：自动补全文件路径和斜杠命令
@@ -180,11 +180,13 @@ function segmentWithMarkers(
 
 这个实现的精巧之处：paste marker 的存在对 word wrap、光标移动、删除操作都是透明的 — 因为它们在分词层就被处理成了原子单元。
 
+paste registry 不是一个"设了就不管"的表 —— 它必须和文本严格对账。删除一个 paste marker（比如退格退掉它）时，Editor 不只是从文本里抹掉标记，还会把 `pastes` Map 里对应条目删掉，并把更大 id 的条目按升序整体下移一位，让 `[paste #3]` 在 `[paste #1]` 被删后变成 `[paste #2]`（`editor.ts:1296-1306`，v0.80.4 [#6397](https://github.com/earendil-works/pi/issues/6397) 修复了删除/清屏后残留陈旧记账的问题）；提交或清屏后整个 registry 连同计数器一起清零（`editor.ts:1265-1266`）。这套记账还有一条不易察觉的支线 —— 它和 undo 是绑定的，见下面的 Undo Stack。
+
 ## IME 支持
 
 IME（Input Method Editor）是中日韩文输入的基础设施。终端中的 IME 支持比 GUI 应用困难得多：
 
-1. **光标定位**。IME 的候选窗口需要显示在光标附近。Editor 在 `render()` 输出中嵌入 `CURSOR_MARKER`，TUI 提取位置后设置硬件光标，IME 读取硬件光标位置来定位候选窗口。
+1. **光标定位**。IME 需要硬件光标来定位候选窗口：它读硬件光标位置弹出拼音/候选框，而用户在编辑器里看到的可见光标其实是 `render()` 反色画出的软件块。这套双层光标的完整机制（软件反色块 + 硬件光标叠加、退出清理）见第 24 章「双层光标模型」，这里只强调 IME 依赖的是硬件光标那一层（[#6790](https://github.com/earendil-works/pi/issues/6790)）。
 
 2. **compose 事件**。IME 的输入过程是多步的 — 用户按下拼音字母，IME 在 compose 状态下显示拼音，用户选择候选字后 IME 发送最终字符。Editor 需要正确处理这个 compose 过程，不能把中间状态当作最终输入。
 
@@ -220,6 +222,12 @@ export function wordWrapLine(
 
 `TextChunk` 不只是文本片段 — 它还记录了在原始行中的起始和结束位置（`startIndex`、`endIndex`）。这让光标在 wrapped 行之间移动时可以正确映射回原始文本位置。
 
+## 滚动指示器的宽度安全
+
+输入内容超过可视高度时，Editor 在被裁掉的方向画一条滚动指示器边框，形如 `─── ↑ 12 more ─────`（`createScrollBorder`，`editor.ts:259-267`）。正常情况下它把提示文字左对齐、右侧用 `─` 补满整行宽度。
+
+问题出在**窄终端**：当终端宽度比提示文字本身还窄时，"补满剩余宽度"的 `remaining` 会变成负数，早期版本据此 `"─".repeat(负数)` 会抛异常、把整个渲染带崩（v0.82.0 [#7015](https://github.com/earendil-works/pi/issues/7015) 修复）。现在的处理是宽度安全的 —— `remaining < 0` 时改走截断分支：用 `sliceByColumn` 按**列宽**（而不是字符数）把指示器截到放得下的宽度，再接一个 `...` 省略号（`editor.ts:265-267`）。按列宽截断这点很重要，因为指示器里可能混有宽度为 2 的字符，按字符数截断仍会溢出。
+
 ## Kill Ring
 
 Editor 实现了 Emacs 风格的 kill ring — `Ctrl+K` 杀掉光标到行尾的内容，`Ctrl+Y` 粘贴最近 kill 的内容。这不是剪贴板 — 它是一个独立的循环缓冲区，保存了多次 kill 的历史。
@@ -229,6 +237,8 @@ Editor 实现了 Emacs 风格的 kill ring — `Ctrl+K` 杀掉光标到行尾的
 ## Undo Stack
 
 编辑器维护了自己的 undo 栈（`UndoStack`），支持 `Ctrl+Z` 撤销和 `Ctrl+Shift+Z` / `Ctrl+Y` 重做。这在终端编辑器中不是标配 — 大多数终端输入框不支持撤销。但对于多行编辑场景（用户可能编辑一段代码片段作为 prompt），撤销功能从"可选"变成了"必要"。
+
+关键的一点是：undo 快照不只存文本。`EditorSnapshot` 里同时装了编辑状态、`pastes` registry 和 `pasteCounter`（`editor.ts:215-220`）—— 每次改动前 `pushUndoSnapshot` 把三者一起压栈，`undo()` 弹栈时把文本和 paste registry 一并还原（`editor.ts:2012-2028`，v0.81.0 [#6844](https://github.com/earendil-works/pi/issues/6844)）。这正是上一节粘贴折叠留下的那条支线：如果 undo 只回滚文本、不回滚 registry，一次"撤销删除 paste marker"就会让标记回到文本里、但它指向的原始内容已经从 registry 里消失，提交时 `[paste #1]` 会展开成空。把 paste registry 纳入 undo 快照，才让"粘贴折叠"和"撤销"这两个看似独立的机制真正自洽。
 
 ## 状态转换的复杂性
 
@@ -260,10 +270,12 @@ Editor 实现了 Emacs 风格的 kill ring — `Ctrl+K` 杀掉光标到行尾的
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0，已对照 v0.79.7 核实。Editor 组件是 pi-tui 中变化最频繁的组件 —
+> 本章核心分析基于 pi-mono v0.66.0，已对照 v0.82.1 核实。Editor 组件是 pi-tui 中变化最频繁的组件 —
 > 几乎每个版本都有交互改进或 bug 修复。Paste marker 机制是后来添加的，
 > 早期版本会直接将大粘贴内容全部显示在编辑器中。
 >
 > v0.66 → v0.79 的主要变化：`AutocompleteProvider` 接口扩展 —— `getSuggestions` 改为多行签名 `(lines, cursorLine, cursorCol, options)`，
 > 新增 `triggerCharacters`（v0.79.1，#4703）与 `shouldTriggerFileCompletion`（v0.69.0），`SlashCommand` 新增 `argumentHint`（v0.67.6）；
 > word wrap 收紧为按 grapheme 边界断行（v0.79.x，#5495），修复 CJK 换行大尾隙；新增基于 `Intl.Segmenter` 的 Unicode 词边界导航/删除（`word-navigation.ts`）。
+>
+> v0.79 → v0.82 的补充：换行默认键位补上 `Ctrl+J`（与 `Shift+Enter` 并列，`keybindings.ts:118`）；undo 快照纳入 paste registry，撤销可同时还原文本与粘贴表（`EditorSnapshot`，v0.81.0 #6844），并补齐 paste marker 删除/清屏后的记账清理（v0.80.4 #6397）；窄终端滚动指示器按列宽截断、不再崩溃（v0.82.0 #7015）；并把 IME 光标定位对齐到第 24 章的双层光标模型（#6790）。

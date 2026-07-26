@@ -29,7 +29,7 @@ flowchart TD
         Append[追加 Context + Tools + Skills]
     end
     
-    Append --> Final["最终 system prompt\n+ 日期 + 工作目录"]
+    Append --> Final["最终 system prompt\n+ 工作目录（日期已移除）"]
     
     Default --> Check
     System --> Check
@@ -269,23 +269,20 @@ if (customPromptHasRead && skills.length > 0) {
 
 只有当 `read` 工具可用时才注入 skills。原因是：skill 是指向文件的指针（"这个 skill 的内容在 `~/.pi/skills/tdd.md`"），不是内联的全文。agent 需要用 `read` 工具来读取 skill 的完整内容。如果 `read` 工具不可用（极少数受限场景），注入 skill 列表反而会误导 agent — 它知道有这些 skill 存在，但没法读取它们。
 
-## 尾部注入：日期与工作目录
+## 尾部注入：工作目录（以及被移除的日期）
 
-无论走哪条路径（默认 prompt 或自定义 prompt），最后都会追加日期和工作目录：
+无论走哪条路径（默认 prompt 或自定义 prompt），最后都会追加工作目录：
 
 ```typescript
-// packages/coding-agent/src/core/system-prompt.ts:163-166
+// packages/coding-agent/src/core/system-prompt.ts:159
 
-prompt += `\nCurrent date: ${date}`;
 prompt += `\nCurrent working directory: ${promptCwd}`;
 return prompt;
 ```
 
-这两个信息放在最后有一个实际考量：它们是 prompt 中最容易被模型注意到的信息（近因偏差），且是模型执行文件操作时最需要的上下文 — 知道当前在哪个目录下工作，才能正确解析相对路径。
+工作目录放在最后有一个实际考量：它是 prompt 中最容易被模型注意到的信息（近因偏差），且是模型执行文件操作时最需要的上下文 —— 知道当前在哪个目录下工作，才能正确解析相对路径。Windows 路径中的反斜杠会被替换为正斜杠（`cwd.replace(/\\/g, "/")`，`system-prompt.ts:39`），因为 LLM 在处理路径时对正斜杠更可靠（反斜杠容易被解释为转义字符）。
 
-Windows 路径中的反斜杠会被替换为正斜杠：`resolvedCwd.replace(/\\/g, "/")`。这是因为 LLM 在处理路径时对正斜杠更可靠（反斜杠容易被解释为转义字符）。
-
-日期的注入看似简单，但对 agent 行为有实际影响。没有日期信息，LLM 可能会生成过时的 API 调用或推荐已废弃的库版本。有了日期，LLM 可以基于其训练数据的时间范围做出更合理的判断。
+> **移除当前日期以稳定 prompt cache（v0.80.7，行为变化）**：这里曾经还有一行 `prompt += \`\nCurrent date: ${date}\``。它被**删掉了**，理由值得展开。system prompt 是发给模型的**第一段、也是最长的固定前缀**，provider 端的 prompt caching 正是靠"前缀逐字节相同"来命中缓存的。而"当前日期"每天都会变 —— 于是每跨过一次午夜，system prompt 前缀就变了一个字节，**整块缓存作废**，第二天第一次请求要重新按未缓存价格计费、且更慢。为一个模型很少真正用到的信息，赔上一个每日必然发生的缓存失效，并不划算。取舍很直白：**得到**稳定的、跨日不失效的 prompt cache 前缀；**放弃**让模型"知道今天几号"（真需要时它可以用 bash 跑 `date`，或由用户/AGENTS.md 显式提供）。这与本章反复出现的判断一致 —— prompt 里凡是会频繁变动的内容，都要为它对缓存的破坏付出代价，值不值得要单独算账。
 
 ## 自定义 Prompt 路径
 
@@ -315,14 +312,13 @@ if (customPrompt) {
     prompt += formatSkillsForPrompt(skills);
   }
 
-  // 最后追加日期和工作目录
-  prompt += `\nCurrent date: ${date}`;
+  // 最后追加工作目录（当前日期已于 v0.80.7 移除）
   prompt += `\nCurrent working directory: ${promptCwd}`;
   return prompt;
 }
 ```
 
-关键区别：自定义 prompt 路径**没有**默认 prompt 中的工具列表、guidelines 生成、pi 文档路径注入。用户完全控制 prompt 的基础部分。但 context files、skills、日期、工作目录仍然会自动追加 — 因为这些是"环境信息"，不管 prompt 怎么定制，agent 都需要知道当前的项目规则和可用能力。
+关键区别：自定义 prompt 路径**没有**默认 prompt 中的工具列表、guidelines 生成、pi 文档路径注入。用户完全控制 prompt 的基础部分。但 context files、skills、工作目录仍然会自动追加 — 因为这些是"环境信息"，不管 prompt 怎么定制，agent 都需要知道当前的项目规则和可用能力。
 
 这种"基础可替换、环境自动追加"的设计在两个需求之间取得了平衡：
 - 用户想完全控制 prompt 的核心指令（"你是一个代码审查专家"）
@@ -355,7 +351,7 @@ flowchart TD
     A["1. 基础 prompt<br/>默认 prompt 或 SYSTEM.md"] --> B["2. appendSystemPrompt<br/>APPEND_SYSTEM.md 或 extension"]
     B --> C["3. Project Context<br/>所有 AGENTS.md / CLAUDE.md"]
     C --> D["4. Skills<br/>available_skills XML 列表"]
-    D --> E["5. 环境信息<br/>Current date + Current working directory"]
+    D --> E["5. 环境信息<br/>Current working directory（日期已移除）"]
     
     style A fill:#e3f2fd
     style B fill:#fff3e0
@@ -402,9 +398,9 @@ Prompt 装配是 pi 产品层的"信息入口" — 它决定了 LLM 在整个会
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0，已校订至 v0.79.7。截至 v0.79.7，prompt 装配有两处设计级变化：
-> ① 项目上下文的边界从 Markdown 标题（`# Project Context` / `## ${path}`）改为 XML 标签
-> （`<project_context>` / `<project_instructions path="...">`，v0.75.0），动机是避免与 AGENTS.md 正文里的标题混淆 —— 这与 skills 注入用 `<available_skills>` 是同一判断。
-> ② "优先用 grep/find/ls 而非 bash"的指引在 v0.77.0 被删除，prompt 不再替模型在工具间做选择，只在"仅有 bash"时兜底。
-> 此外，装配输入在 `before_agent_start` 通过 `systemPromptOptions` 暴露给 extension（v0.68.0），`cwd` 成为必填（去 process.cwd() 兜底）。
+> 本章核心分析基于 pi-mono v0.66.0，已对照 **v0.82.1**。prompt 装配有几处设计级变化：
+> ① **默认系统提示词移除"当前日期"**（v0.80.7，行为变化）：尾部只剩 `Current working directory`，动机是避免每天跨午夜时 prompt-cache 前缀失效 —— 得到跨日稳定的缓存，放弃让模型直接知道日期。
+> ② 项目上下文的边界从 Markdown 标题（`# Project Context` / `## ${path}`）改为 XML 标签（`<project_context>` / `<project_instructions path="...">`，v0.75.0），动机是避免与 AGENTS.md 正文里的标题混淆 —— 这与 skills 注入用 `<available_skills>` 是同一判断。
+> ③ "优先用 grep/find/ls 而非 bash"的指引在 v0.77.0 被删除，prompt 不再替模型在工具间做选择，只在"仅有 bash"时兜底。
+> 此外，装配输入在 `before_agent_start` 通过 `systemPromptOptions` 暴露给 extension（v0.68.0），`cwd` 成为必填（去 process.cwd() 兜底）；扩展工具变更在同一 run 内下次请求前生效、不丢弃 `before_agent_start` 的系统提示词覆盖（v0.80.3）。
 > `buildSystemPrompt` 的纯函数设计（不做 I/O）、`formatSkillsForPrompt` 的 XML 注入、`APPEND_SYSTEM.md` 轻量追加这三点自始至终保持不变。

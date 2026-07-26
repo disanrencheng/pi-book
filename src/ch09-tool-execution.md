@@ -239,6 +239,28 @@ async function finalizeExecutedToolCall(
 - **错误降级**：某些工具的"错误"其实是预期的（比如 grep 没找到匹配），改 isError 为 false
 - **结果增强**：在 details 中注入额外元数据供 UI 展示
 
+**工具结果还能动态引入新工具**。除了 content / details / terminate，`AgentToolResult` 上还有一个字段 `addedToolNames?: string[]`（`types.ts:363`）：一个工具在返回结果时，可以声明"从这条转录点起，这些新工具变得可用"。finalize 阶段把它原样传播到最终写入上下文的 `ToolResultMessage` 上（`agent-loop.ts:783`，仅在非空时带上该字段）：
+
+```typescript
+// packages/agent/src/agent-loop.ts:773-786（简化）
+function createToolResultMessage(finalized): ToolResultMessage {
+  return {
+    role: "toolResult",
+    toolCallId: finalized.toolCall.id,
+    toolName: finalized.toolCall.name,
+    content: finalized.result.content ?? [],
+    details: finalized.result.details,
+    ...(finalized.result.addedToolNames?.length
+      ? { addedToolNames: finalized.result.addedToolNames }   // ← 传播
+      : {}),
+    isError: finalized.isError,
+    timestamp: Date.now(),
+  };
+}
+```
+
+这就打通了一条**消息锚定的工具加载**（message-anchored tool loading，v0.80.7）通道：某个工具的执行结果本身可以"解锁"一批后续工具，而且解锁点被钉在具体的转录位置上 —— 从这条 `ToolResultMessage` 往后的 turn 才看得到这些新工具，转录回放时也能在同一个锚点复现同样的可用工具集。典型场景是一个"进入某子系统 / 加载某 skill"的工具，执行后才把该子系统专属的工具暴露给模型，而不必一开始就把全部工具塞进 context。注意 pi 在这里只负责**传播这个字段**；真正据此把工具加进 active 集合是上层（工具来源管理方）的职责。
+
 ## Parallel vs Sequential：两种执行策略
 
 当 LLM 一次返回多个工具调用时，pi 提供了两种执行策略：
@@ -386,11 +408,13 @@ async function executeToolCallsParallel(...) {
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0，并同步到 v0.79.7。三阶段管道结构稳定。
+> 本章核心分析基于 pi-mono v0.66.0，并已对照 v0.82.1。三阶段管道结构稳定。
 > `parallel` 执行模式作为默认策略引入，取代了最初的纯 `sequential` 模式；
 > v0.79 起 `AgentTool` 新增 per-tool `executionMode`，批次中任一工具声明 `"sequential"`
 > 即令整批降级串行。v0.68.1 起 parallel 模式的 execute+finalize 改为并发结算：
 > 生命周期事件 `tool_execution_end` 按**完成顺序**发射，而持久化的 tool-result 工件仍按
 > **源顺序**拼装（旧版"finalize 严格按源顺序"的描述已不适用）。v0.69.0 起
 > `executeToolCalls` 返回 `{ messages, terminate }`，工具可通过整批 `terminate` 提示请求
-> agent 停止。`prepareArguments` 钩子为支持 edit 工具 API 演进而添加。
+> agent 停止。`prepareArguments` 钩子为支持 edit 工具 API 演进而添加。v0.80.7 起
+> `AgentToolResult.addedToolNames` 会传播到 `ToolResultMessage`（`agent-loop.ts:783`），
+> 支持消息锚定的动态工具引入：工具结果可从该转录点起解锁一批后续工具。

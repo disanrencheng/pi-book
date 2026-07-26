@@ -32,7 +32,7 @@ export interface Component {
 
 `invalidate()` 通知 TUI 组件需要重绘。调用后 TUI 会在下一个 render cycle 重新调用 `render()`。组件的缓存状态（如果有的话）也应该在 `invalidate()` 中清除。
 
-## Focusable 接口与硬件光标
+## Focusable 接口与双层光标模型
 
 ```typescript
 // packages/tui/src/tui.ts:52-68
@@ -43,11 +43,15 @@ export interface Focusable {
 export const CURSOR_MARKER = "\x1b_pi:c\x07";
 ```
 
-`Focusable` 是 `Component` 的增强接口。当一个组件获得焦点时，TUI 设置它的 `focused` 属性为 `true`。组件在 `render()` 中如果需要显示光标（比如编辑器的文本光标），就在光标位置输出 `CURSOR_MARKER`。
+`Focusable` 是 `Component` 的增强接口。当一个组件获得焦点时，TUI 设置它的 `focused` 属性为 `true`。
 
-`CURSOR_MARKER` 是一个 APC（Application Program Command）转义序列 — 终端会忽略它，但 TUI 可以在渲染后找到它的位置，然后把硬件光标移到那里。
+这里容易产生一个误解：以为终端里只有终端硬件光标这一个光标。pi 实际上用了**两层光标**，各司其职。
 
-为什么需要硬件光标？因为 **IME 输入法**。中文、日文、韩文的输入法需要知道光标位置来显示候选窗口。如果没有正确定位的硬件光标，候选窗口会出现在错误的位置。这个看似小众的需求，决定了 pi-tui 必须实现光标追踪。
+**第一层：反色软件光标（用户看到的那个）。** 编辑器并不依赖硬件光标来"显示"光标位置 —— 它在 `render()` 输出里，把光标所在的那个 grapheme 用反色（SGR `\x1b[7m … \x1b[0m`）画出来；光标停在行尾时则反色一个空格（`packages/tui/src/components/editor.ts:549-564`）。这个反色块才是用户视觉上看到的光标，它随差分渲染一起刷新，不受终端硬件光标能力差异的影响。
+
+**第二层：硬件光标（IME 定位叠加层）。** 组件在反色块之前，还会在同一位置输出一个零宽的 `CURSOR_MARKER`（`editor.ts:549-550`）。`CURSOR_MARKER` 是一个 APC（Application Program Command）转义序列 —— 终端会忽略它，但 TUI 渲染后能找到它的位置，把真正的硬件光标移过去。硬件光标在这里几乎不承担"显示"职责，它只是一个**给 IME 用的定位叠加层**：中文、日文、韩文输入法需要读硬件光标位置来放置候选窗口，没有它候选框会飘到错误的地方。
+
+两层分工带来一个必须小心的收尾：**退出时要先清软件光标、再交还硬件光标**。`stop()` 会先写一个普通空格覆盖掉那个反色块（否则退出后终端里会残留一个反色残影），把光标移到内容末尾，最后才 `showCursor()` 恢复正常硬件光标（`tui.ts:698-712`）。v0.81.0 的清屏修复（[#6790](https://github.com/earendil-works/pi/issues/6790)）正是暴露并补上了这个顺序 —— 在此之前退出后会留下一块反色光标残影。
 
 ## TUI 类：渲染引擎
 
@@ -296,6 +300,14 @@ export function detectCapabilities(...): TerminalCapabilities
 
 `ImageRenderOptions` 还支持 `imageId`（复用/替换同一张图，避免重复传输）等细节。但设计要点始终一致：能力是探测出来的，不支持就优雅降级到文本。
 
+## 文本渲染的边界细节
+
+自建渲染的代价，是连"把文本正确地铺到终端上"这种小事都得自己兜底。几个 v0.8x 期间补上的细节值得一提：
+
+- **ANSI 感知换行**。`wrapTextWithAnsi()` 按 `\r\n | \r | \n` 统一识别 CRLF/CR/LF 三种换行，并用一个 `AnsiCodeTracker` 跨行追踪 SGR 状态 —— 换行后仍处于激活状态的样式会被补写到续行开头，避免颜色/加粗在硬换行处意外中断（`packages/tui/src/utils.ts:715-735`，[#6764](https://github.com/earendil-works/pi/issues/6764)）。
+- **Markdown source-preservation 选项族**。`MarkdownOptions` 允许调用方选择"按源码原样保留"而非规范化：除了早先的 `preserveOrderedListMarkers`（保留源列表序号），v0.80.3 新增 `preserveBackslashEscapes`，让被反斜杠转义的标点原样保留、不被渲染器吃掉（`packages/tui/src/components/markdown.ts:101-102`，[#6105](https://github.com/earendil-works/pi/issues/6105)）。
+- **流式代码围栏防闪烁**。流式渲染 Markdown 时，尚未闭合的代码围栏一度会随 token 到达而闪烁、抖动；现在部分闭合的围栏渲染稳定，不再收缩跳变（[#5846](https://github.com/earendil-works/pi/issues/5846)）。
+
 ### 得到了什么
 
 **完全的控制力**。差分渲染的粒度、IME 支持（通过 CURSOR_MARKER 定位硬件光标）、Kitty keyboard protocol 支持 — 这些都需要直接操作终端转义序列，框架反而会碍事。
@@ -313,10 +325,12 @@ export function detectCapabilities(...): TerminalCapabilities
 ---
 
 ### 版本演化说明
-> 本章核心分析基于 pi-mono v0.66.0，已对照 v0.79.7 核实。pi-tui 仍是 pi-mono 中最稳定的包之一：
+> 本章核心分析基于 pi-mono v0.66.0，已对照 v0.82.1 核实。pi-tui 仍是 pi-mono 中最稳定的包之一：
 > Component 接口自创建以来没有改变，新功能通过添加新组件实现。
 > Overlay 系统是后来添加的 — 早期版本的模态交互（如模型选择）直接替换主内容。
 >
 > v0.66 → v0.79 的主要变化：`Container.render` 因长会话栈溢出（#2651，v0.67.0）从 spread-push 改为逐行 push；
 > 新增亮/暗配色探测（OSC 11，`terminal-colors.ts`）与运行时订阅；新增 Kitty 图片（graphics）协议及降级（`terminal-image.ts`，Warp 支持见 #5841）；
 > 终端能力检测扩展到 OSC 8 超链接、tmux 透传、Windows Terminal/JetBrains 等。运行环境最低 Node 版本提升到 **22.19.0**（v0.75.0，Breaking）。
+>
+> v0.79 → v0.82 的补充：厘清了**双层光标模型** —— 用户看到的是编辑器渲染的反色软件光标，硬件光标只是 IME 定位叠加层，退出时先清软件光标再恢复硬件光标（#6790）；`wrapTextWithAnsi` 归一化 CRLF/CR 并跨行保留 ANSI 样式（#6764）；Markdown 渲染新增 `preserveBackslashEscapes` 源码保留选项（#6105）、流式代码围栏不再闪烁（#5846）。
